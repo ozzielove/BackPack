@@ -1,0 +1,36 @@
+---
+name: Discipline Webhook
+active: true
+nodes:
+  # 1) Webhook listener
+  - name: DisciplineWebhook
+    type: n8n-nodes-base.webhook
+    typeVersion: 1
+    position:
+      x: 250
+      y: 300
+    parameters:
+      httpMethod: POST
+      path: discipline
+      responseMode: onReceived
+      responseData:
+        statusCode: 200
+        contentType: application/json
+        responseBody: '{"status":"received","message":"Discipline event logged"}'
+  # 2) (Optional) Dummy "log" node to show the incoming payload in the editor
+  - name: Logger
+    type: n8n-nodes-base.function
+    typeVersion: 1
+    position:
+      x: 450
+      y: 300
+    parameters:
+      functionCode: |
+        // simply forward the incoming JSON to the workflow output
+        return items;
+connections:
+  DisciplineWebhook:
+    main:
+      - node: Logger
+        type: main
+        index: 0

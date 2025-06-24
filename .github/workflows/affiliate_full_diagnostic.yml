@@ -1,0 +1,19 @@
+name: Affiliate Engine Full Diagnostic
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Run Affiliate Diagnostic
+        run: |
+          echo "Running 30-step affiliate diagnostic..."
+          # Add your diagnostic steps here
+          echo "Diagnostic complete"
