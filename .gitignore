@@ -1,0 +1,27 @@
+# macOS noise
+.DS_Store
+.Trash/
+**/__pycache__/
+*.pyc
+
+# venv / python tools
+venv/
+.venv/
+*.bak.*
+
+# editor / IDE
+*.swp
+.idea/
+.vscode/
+
+# runtime artefacts
+charts/
+tmp/
+*.log
+*.pickle
+
+# secrets
+.env
+.env.*
+.supabase_password.txt
+.token
