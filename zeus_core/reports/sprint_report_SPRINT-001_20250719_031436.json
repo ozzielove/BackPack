@@ -1,0 +1,109 @@
+{
+  "sprint": {
+    "id": "SPRINT-001",
+    "name": "Test Sprint - Q3 Development",
+    "start_date": "2025-07-14T03:14:35.144579",
+    "end_date": "2025-07-28T03:14:35.144588",
+    "total_points": 44,
+    "completed_points": 13,
+    "remaining_points": 31
+  },
+  "summary": {
+    "completion_rate": 28.57142857142857,
+    "velocity": 13,
+    "value_delivered": "Delivered 13 story points across 2 completed items (28.6% completion rate). Below-target sprint performance requiring analysis.",
+    "key_achievements": [
+      "Completed 1 high-value items (8+ points)",
+      "Maintained system stability throughout sprint"
+    ]
+  },
+  "performance_metrics": [
+    {
+      "name": "Sprint Velocity",
+      "value": 13,
+      "unit": "story_points",
+      "target": 35.2,
+      "meeting_target": false,
+      "variance": -63.06818181818182
+    },
+    {
+      "name": "Story Completion Rate",
+      "value": 28.57142857142857,
+      "unit": "percentage",
+      "target": 85.0,
+      "meeting_target": false,
+      "variance": -66.38655462184873
+    },
+    {
+      "name": "Sprint Duration Utilization",
+      "value": 35.714285714285715,
+      "unit": "percentage",
+      "target": 100.0,
+      "meeting_target": false,
+      "variance": -64.28571428571428
+    },
+    {
+      "name": "Burndown Health Score",
+      "value": 87.66233766233766,
+      "unit": "score",
+      "target": 75.0,
+      "meeting_target": true,
+      "variance": 16.883116883116884
+    }
+  ],
+  "system_diagnostics": [
+    {
+      "agent": "burndown_agent",
+      "status": "error",
+      "details": {
+        "error": "cannot import name 'create_test_sprint' from 'zeus_core.models' (/Users/ozirusmorency/sentinel_reboot/zeus_core/zeus_core/models.py)"
+      },
+      "response_time_ms": 1133.8010000000002
+    },
+    {
+      "agent": "impediment_agent",
+      "status": "healthy",
+      "details": {
+        "total_impediments": 0,
+        "resolution_rate": 0,
+        "last_check": "2025-07-19T03:14:36.279197"
+      },
+      "response_time_ms": 0.7290000000000001
+    },
+    {
+      "agent": "resource_agent",
+      "status": "healthy",
+      "details": {
+        "cpu_usage": 45.2,
+        "memory_usage": 67.8,
+        "disk_usage": 23.1,
+        "last_check": "2025-07-19T03:14:36.279207"
+      },
+      "response_time_ms": 0.002
+    },
+    {
+      "agent": "notification_agent",
+      "status": "healthy",
+      "details": {
+        "slack_webhook_configured": false,
+        "email_configured": false,
+        "last_notification": "2025-01-19T15:30:00",
+        "last_check": "2025-07-19T03:14:36.279214"
+      },
+      "response_time_ms": 0.005
+    },
+    {
+      "agent": "integration_agent",
+      "status": "warning",
+      "details": {
+        "jira_connection": false,
+        "github_connection": true,
+        "s3_connection": true,
+        "last_sync": "2025-01-19T14:00:00",
+        "last_check": "2025-07-19T03:14:36.279217"
+      },
+      "response_time_ms": 0.001
+    }
+  ],
+  "generated_at": "2025-07-19T03:14:36.279232"
+}
