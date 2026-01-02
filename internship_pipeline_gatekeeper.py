@@ -2,6 +2,7 @@
 """Internship pipeline gatekeeper with verification, SSRF guard, and persistence."""
 
 import argparse
+import doctest
 import csv
 import datetime as dt
 import ipaddress
@@ -58,6 +59,8 @@ VERIFICATION_BASE_COLUMNS = [
     "Source",
     "Folder Path",
 ]
+
+_TEST_TEMP_ROOT: Optional[str] = None
 
 
 def normalize_hostname(host: str) -> str:
@@ -128,18 +131,21 @@ def csv_roundtrip_demo() -> bool:
     """>>> csv_roundtrip_demo()
 True
 """
-    base_dir = os.path.dirname(EXCLUSIONS_DEFAULT) or "."
-    os.makedirs(base_dir, exist_ok=True)
-    fd, path = tempfile.mkstemp(dir=base_dir, prefix="roundtrip_", suffix=".csv", text=True)
-    os.close(fd)
-    try:
+    global _TEST_TEMP_ROOT
+    with tempfile.TemporaryDirectory() as tmp:
+        prev_env = os.environ.get("GATEKEEPER_TEST_MODE")
+        os.environ["GATEKEEPER_TEST_MODE"] = "1"
+        _TEST_TEMP_ROOT = tmp
+        path = os.path.join(tmp, "roundtrip.csv")
         rows = [{"a": "1", "b": "2"}]
-        write_csv_atomic(path, rows, ["a", "b"], None)
+        write_csv_atomic(path, rows, ["a", "b"], None, allow_test=True)
         read = read_csv(path)
+        if prev_env is None:
+            os.environ.pop("GATEKEEPER_TEST_MODE", None)
+        else:
+            os.environ["GATEKEEPER_TEST_MODE"] = prev_env
+        _TEST_TEMP_ROOT = None
         return read == rows
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
 
 
 def setup_logging(quiet: bool, verbose: bool) -> None:
@@ -155,6 +161,14 @@ def is_within(path: str, root: str) -> bool:
     real = os.path.realpath(path)
     root_real = os.path.realpath(root)
     return real == root_real or real.startswith(root_real + os.sep)
+
+
+def _allow_test_writes(path: str) -> bool:
+    if os.environ.get("GATEKEEPER_TEST_MODE") != "1":
+        return False
+    if not _TEST_TEMP_ROOT:
+        return False
+    return is_within(path, _TEST_TEMP_ROOT)
 
 
 def safe_file_write(path: str, args) -> bool:
@@ -196,8 +210,11 @@ def read_csv(path: str) -> List[Dict[str, str]]:
         return [{k: v for k, v in row.items()} for row in reader]
 
 
-def write_csv_atomic(path: str, rows: List[Dict[str, str]], fieldnames: List[str], args) -> None:
-    if args is not None and not safe_file_write(path, args):
+def write_csv_atomic(path: str, rows: List[Dict[str, str]], fieldnames: List[str], args, allow_test: bool = False) -> None:
+    if args is not None:
+        if not safe_file_write(path, args):
+            raise ValueError("Unsafe write path")
+    elif not (allow_test and _allow_test_writes(path)):
         raise ValueError("Unsafe write path")
     fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp_gatekeeper_", text=True)
     os.close(fd)
@@ -481,7 +498,7 @@ def triage(args) -> int:
             logging.warning("Folder missing, skipping triage: %s", folder)
             continue
         status = row.get("Status", "")
-        if not is_application_folder(folder, allowed_roots + [os.path.realpath(args.pal_dir)]):
+        if not is_application_folder(folder, allowed_roots):
             continue
         if status == "EXCLUDE":
             actions.append(("delete", folder, row.get("Company", ""), row))
@@ -664,6 +681,69 @@ def exclude(args) -> int:
     return 0
 
 
+def self_test(args) -> int:
+    global _TEST_TEMP_ROOT
+    prev_env = os.environ.get("GATEKEEPER_TEST_MODE")
+    doctest_failures = 0
+    plan_ok = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GATEKEEPER_TEST_MODE"] = "1"
+            _TEST_TEMP_ROOT = tmp
+            doctest_failures, _ = doctest.testmod()
+            temp_pal = tmp
+            temp_need = os.path.join(tmp, "Need_To_Apply")
+            os.makedirs(temp_need, exist_ok=True)
+            temp_js = os.path.join(temp_pal, "Job_Search_System")
+            os.makedirs(temp_js, exist_ok=True)
+            temp_ver = os.path.join(temp_js, "internship_verification_list.csv")
+            temp_exc = os.path.join(temp_js, "search_exclusions.csv")
+            temp_tracker = os.path.join(temp_pal, "job_application_tracker.csv")
+            ingest_args = argparse.Namespace(
+                pal_dir=temp_pal,
+                need_to_apply=temp_need,
+                exclusions=temp_exc,
+                verification=temp_ver,
+                tracker=temp_tracker,
+                yes=False,
+                verbose=False,
+                quiet=False,
+                timeout=args.timeout,
+                max_bytes=args.max_bytes,
+                user_agent=args.user_agent,
+                command="ingest",
+            )
+            verify_args = argparse.Namespace(
+                pal_dir=temp_pal,
+                need_to_apply=temp_need,
+                exclusions=temp_exc,
+                verification=temp_ver,
+                tracker=temp_tracker,
+                yes=False,
+                verbose=False,
+                quiet=False,
+                timeout=args.timeout,
+                max_bytes=args.max_bytes,
+                user_agent=args.user_agent,
+                command="verify",
+            )
+            if ingest(ingest_args) != 0:
+                plan_ok = False
+            if verify(verify_args) != 0:
+                plan_ok = False
+    finally:
+        if prev_env is None:
+            os.environ.pop("GATEKEEPER_TEST_MODE", None)
+        else:
+            os.environ["GATEKEEPER_TEST_MODE"] = prev_env
+        _TEST_TEMP_ROOT = None
+    if doctest_failures == 0 and plan_ok:
+        print("self-test passed")
+        return 0
+    print(f"self-test failed: doctest_failures={doctest_failures}, plan_ok={plan_ok}")
+    return 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Internship pipeline gatekeeper")
     parser.add_argument("--pal-dir", default=PAL_ROOT_DEFAULT)
@@ -681,6 +761,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     subparsers.add_parser("ingest", help="Ingest folders into verification list")
     subparsers.add_parser("verify", help="Verify pending/monitor listings")
     subparsers.add_parser("triage", help="Move folders based on verification status")
+    subparsers.add_parser("self-test", help="Run internal self-tests")
     mark = subparsers.add_parser("mark-applied", help="Mark application as applied")
     mark.add_argument("--company", required=True)
     mark.add_argument("--status", default="Applied")
@@ -702,6 +783,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return mark_applied(args)
     if args.command == "exclude":
         return exclude(args)
+    if args.command == "self-test":
+        return self_test(args)
     return 1
 
 
