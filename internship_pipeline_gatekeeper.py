@@ -147,38 +147,35 @@ def is_within(path: str, root: str) -> bool:
 
 
 def safe_file_write(path: str, args) -> bool:
-    targets = {
-        os.path.realpath(args.exclusions),
-        os.path.realpath(args.verification),
-        os.path.realpath(args.tracker),
-    }
     real = os.path.realpath(path)
-    if real not in targets:
+    exclusions_ok = real == os.path.realpath(args.exclusions) and is_within(
+        real, os.path.join(os.path.realpath(args.pal_dir), "Job_Search_System")
+    )
+    verification_ok = real == os.path.realpath(args.verification) and is_within(
+        real, os.path.join(os.path.realpath(args.pal_dir), "Job_Search_System")
+    )
+    tracker_ok = real == os.path.realpath(args.tracker) and is_within(
+        real, os.path.realpath(args.pal_dir)
+    )
+    return exclusions_ok or verification_ok or tracker_ok
+
+
+def is_application_folder(path: str, allowed_roots: List[str]) -> bool:
+    real = os.path.realpath(path)
+    if not os.path.basename(real).endswith("_Application"):
         return False
-    if real == os.path.realpath(args.exclusions) or real == os.path.realpath(args.verification):
-        return is_within(real, os.path.join(os.path.realpath(args.pal_dir), "Job_Search_System"))
-    return is_within(real, os.path.realpath(args.pal_dir))
+    return any(is_within(real, root) for root in allowed_roots)
 
 
-def safe_folder_action(path: str, args) -> bool:
-    pal = os.path.realpath(args.pal_dir)
-    nta = os.path.realpath(args.need_to_apply)
-    ntv = os.path.realpath(os.path.join(args.pal_dir, "Need_To_Verify"))
-    return is_within(path, pal) or is_within(path, nta) or is_within(path, ntv)
+def triage_allowed_roots(args) -> List[str]:
+    return [os.path.realpath(args.need_to_apply), os.path.realpath(os.path.join(args.pal_dir, "Need_To_Verify"))]
 
 
-def ensure_header(path: str, header: List[str], args) -> List[str]:
-    if not os.path.exists(path):
-        write_csv_atomic(path, [], header, args)
-        return header
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        try:
-            existing = next(reader)
-        except StopIteration:
-            write_csv_atomic(path, [], header, args)
-            return header
-    return existing
+def safe_folder_action(path: str, args, allow_pal_root: bool = False) -> bool:
+    roots = triage_allowed_roots(args)
+    if allow_pal_root:
+        roots.append(os.path.realpath(args.pal_dir))
+    return is_application_folder(path, roots)
 
 
 def read_csv(path: str) -> List[Dict[str, str]]:
@@ -214,16 +211,19 @@ def merge_fieldnames(existing: List[str], required: List[str]) -> List[str]:
     return present
 
 
-def load_or_init_csv(path: str, base_header: List[str], args) -> Tuple[List[Dict[str, str]], List[str]]:
+def load_or_init_csv(
+    path: str, base_header: List[str], args, write_allowed: bool
+) -> Tuple[List[Dict[str, str]], List[str], bool]:
     if not os.path.exists(path):
-        write_csv_atomic(path, [], base_header, args)
-        return [], base_header
+        if write_allowed:
+            write_csv_atomic(path, [], base_header, args)
+        return [], base_header, True
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         header = reader.fieldnames or base_header
         rows = [{k: v for k, v in row.items()} for row in reader]
     header = merge_fieldnames(header, base_header)
-    return rows, header
+    return rows, header, False
 
 
 def extract_url_from_json(data: Dict[str, str]) -> str:
@@ -324,7 +324,9 @@ def ensure_directory(path: str) -> None:
 
 
 def ingest(args) -> int:
-    rows, header = load_or_init_csv(args.verification, VERIFICATION_BASE_COLUMNS, args)
+    rows, header, missing = load_or_init_csv(
+        args.verification, VERIFICATION_BASE_COLUMNS, args, write_allowed=args.yes
+    )
     existing_by_company = {r.get("Company", ""): r for r in rows}
     updated_rows = list(rows)
     added = []
@@ -374,6 +376,8 @@ def ingest(args) -> int:
             added.append(({}, new_row))
     if not args.yes:
         print(f"PLAN ingest: read {len(rows)} rows, would write {len(updated_rows)} rows")
+        if missing:
+            print(f"Would create {args.verification}")
         for line in diff_preview(changed + added):
             print(line)
         return 0
@@ -385,7 +389,9 @@ def ingest(args) -> int:
 
 
 def verify(args) -> int:
-    rows, header = load_or_init_csv(args.verification, VERIFICATION_BASE_COLUMNS, args)
+    rows, header, missing = load_or_init_csv(
+        args.verification, VERIFICATION_BASE_COLUMNS, args, write_allowed=args.yes
+    )
     updates = []
     for row in rows:
         if row.get("Status") not in {"PENDING", "MONITOR"}:
@@ -414,6 +420,8 @@ def verify(args) -> int:
             row.update(new_row)
     if not args.yes:
         print(f"PLAN verify: would evaluate {len(updates)} rows; {len(changes)} status changes")
+        if missing:
+            print(f"Verification file missing; would create {args.verification}")
         for url in plan_fetch[:10]:
             print(f"Would fetch: {url}")
         for line in diff_preview(changes):
@@ -427,7 +435,9 @@ def verify(args) -> int:
 
 
 def append_exclusion(path: str, company: str, reason: str, source: str, args) -> None:
-    rows, header = load_or_init_csv(path, ["Company", "Reason", "Date Added", "Source"], args)
+    rows, header, _ = load_or_init_csv(
+        path, ["Company", "Reason", "Date Added", "Source"], args, write_allowed=args.yes
+    )
     rows.append(
         {
             "Company": company,
@@ -440,40 +450,67 @@ def append_exclusion(path: str, company: str, reason: str, source: str, args) ->
 
 
 def triage(args) -> int:
-    rows, header = load_or_init_csv(args.verification, VERIFICATION_BASE_COLUMNS, args)
+    rows, header, missing = load_or_init_csv(
+        args.verification, VERIFICATION_BASE_COLUMNS, args, write_allowed=args.yes
+    )
     changes = []
     need_to_verify = os.path.join(args.pal_dir, "Need_To_Verify")
     actions = []
+    allowed_roots = triage_allowed_roots(args)
     for row in rows:
         folder = row.get("Folder Path", "")
         if not folder:
             continue
         status = row.get("Status", "")
-        company = row.get("Company", "")
+        if not is_application_folder(folder, allowed_roots + [os.path.realpath(args.pal_dir)]):
+            continue
         if status == "EXCLUDE":
-            actions.append(("delete", folder, company, row))
+            actions.append(("delete", folder, row.get("Company", ""), row))
         elif status in {"PENDING", "MONITOR"}:
             dest = os.path.join(need_to_verify, os.path.basename(folder))
-            actions.append(("move", folder, dest, row))
+            actions.append(("move", folder, dest, row, "to_verify"))
+        elif status == "APPLY" and is_within(os.path.realpath(folder), os.path.realpath(need_to_verify)):
+            dest = os.path.join(os.path.realpath(args.need_to_apply), os.path.basename(folder))
+            actions.append(("move", folder, dest, row, "to_apply"))
     if not args.yes:
         print(f"PLAN triage: {len(actions)} actions")
+        if missing:
+            print(f"Verification file missing; would create {args.verification}")
         for act in actions[:10]:
-            print(act[:3])
+            kind = act[0]
+            if kind == "delete":
+                _, src, company, _ = act
+                print(f"DELETE {src} ({company})")
+            else:
+                _, src, tgt, row, _ = act
+                print(f"MOVE {src} -> {tgt} ({row.get('Company','')})")
         return 0
     ensure_directory(need_to_verify)
     for act in actions:
-        kind, src, tgt, row = act
-        if kind == "delete":
-            if safe_folder_action(src, args) and os.path.exists(src):
+        if act[0] == "delete":
+            _, src, _, row = act
+            if is_application_folder(src, allowed_roots) and os.path.exists(src):
                 shutil.rmtree(src, ignore_errors=True)
                 append_exclusion(args.exclusions, row.get("Company", ""), "Verification exclude", "triage", args)
-        elif kind == "move":
-            if safe_folder_action(src, args) and safe_folder_action(os.path.dirname(tgt), args):
+        else:
+            _, src, tgt, row, _ = act
+            src_ok = is_application_folder(src, allowed_roots)
+            tgt_ok = is_application_folder(tgt, [os.path.realpath(args.need_to_apply), os.path.realpath(need_to_verify)])
+            if src_ok and tgt_ok:
+                ensure_directory(os.path.dirname(tgt))
+                before = dict(row)
                 shutil.move(src, tgt)
                 row["Folder Path"] = tgt
-                changes.append((row, dict(row)))
+                changes.append((before, dict(row)))
     write_csv_atomic(args.verification, rows, header, args)
-    print(f"Applied triage: {len(actions)} actions")
+    print(f"Applied triage: {len(actions)} actions; {len(changes)} row updates")
+    for line in diff_preview(changes):
+        print(line)
+    for act in actions[:10]:
+        if act[0] == "delete":
+            print(f"Deleted {act[1]}")
+        else:
+            print(f"Moved {act[1]} -> {act[2]}")
     return 0
 
 
@@ -499,8 +536,12 @@ def load_job_description(company_folder: str) -> Dict[str, str]:
 
 
 def mark_applied(args) -> int:
-    tracker_rows, tracker_header = load_or_init_csv(args.tracker, REQUIRED_TRACKER_COLUMNS, args)
-    exclusions_rows, exclusions_header = load_or_init_csv(args.exclusions, ["Company", "Reason", "Date Added", "Source"], args)
+    tracker_rows, tracker_header, tracker_missing = load_or_init_csv(
+        args.tracker, REQUIRED_TRACKER_COLUMNS, args, write_allowed=args.yes
+    )
+    exclusions_rows, exclusions_header, exclusions_missing = load_or_init_csv(
+        args.exclusions, ["Company", "Reason", "Date Added", "Source"], args, write_allowed=args.yes
+    )
     company_folder = os.path.join(args.need_to_apply, f"{args.company}_Application")
     dest_folder = os.path.join(args.pal_dir, f"{args.company}_Application")
     jd = load_job_description(company_folder)
@@ -526,17 +567,28 @@ def mark_applied(args) -> int:
         "Date Added": date_applied,
         "Source": "application_submitted",
     }
+    if not os.path.exists(company_folder):
+        print("Application folder missing; cannot mark applied")
+        return 2
+    if os.path.exists(dest_folder):
+        print("Destination already exists; aborting to avoid overwrite")
+        return 3
     if not args.yes:
         print("PLAN mark-applied:")
+        if tracker_missing:
+            print(f"Would create {args.tracker}")
+        if exclusions_missing:
+            print(f"Would create {args.exclusions}")
         print(f"Move {company_folder} -> {dest_folder}")
         print(f"Append exclusion: {new_exclusion_row}")
         print(f"Append tracker row: {new_tracker_row}")
         return 0
-    if not safe_folder_action(company_folder, args) or not safe_folder_action(dest_folder, args):
+    if not safe_folder_action(company_folder, args, allow_pal_root=True) or not is_application_folder(
+        dest_folder, [os.path.realpath(args.pal_dir)]
+    ):
         print("Unsafe path")
         return 1
-    if os.path.exists(company_folder):
-        shutil.move(company_folder, dest_folder)
+    shutil.move(company_folder, dest_folder)
     exclusions_rows.append(new_exclusion_row)
     write_csv_atomic(args.exclusions, exclusions_rows, exclusions_header, args)
     tracker_rows.append(new_tracker_row)
@@ -546,9 +598,12 @@ def mark_applied(args) -> int:
 
 
 def exclude(args) -> int:
-    rows, header = load_or_init_csv(args.verification, VERIFICATION_BASE_COLUMNS, args)
+    rows, header, missing = load_or_init_csv(
+        args.verification, VERIFICATION_BASE_COLUMNS, args, write_allowed=args.yes
+    )
     target_folder = os.path.join(args.need_to_apply, f"{args.company}_Application")
     changed = []
+    found = False
     for row in rows:
         if row.get("Company") == args.company:
             new_row = dict(row)
@@ -556,9 +611,26 @@ def exclude(args) -> int:
             new_row["Reason"] = args.reason
             changed.append((row, new_row))
             row.update(new_row)
+            found = True
             break
+    if not found:
+        new_row = {k: "" for k in header}
+        new_row.update(
+            {
+                "Company": args.company,
+                "Status": "EXCLUDE",
+                "Reason": args.reason,
+                "Date Added": dt.date.today().isoformat(),
+                "Source": "exclude_command",
+                "Folder Path": target_folder if os.path.exists(target_folder) else "",
+            }
+        )
+        rows.append(new_row)
+        changed.append(({}, new_row))
     if not args.yes:
         print("PLAN exclude:")
+        if missing:
+            print(f"Verification file missing; would create {args.verification}")
         print(f"Delete {target_folder}")
         for line in diff_preview(changed):
             print(line)
@@ -568,6 +640,8 @@ def exclude(args) -> int:
     append_exclusion(args.exclusions, args.company, args.reason, "exclude_command", args)
     write_csv_atomic(args.verification, rows, header, args)
     print("Applied exclude")
+    for line in diff_preview(changed):
+        print(line)
     return 0
 
 
