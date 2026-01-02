@@ -1,11 +1,11 @@
 """Brand color extractor script.
 
-Extracts brand palette heuristically from a website without rendering HTML.
+Zero-trust palette extraction with caching, SSRF protections, and provenance-aware
+weighting. Network and writes only occur with --yes (unless a cached palette is
+served). Doctest examples cover key helpers.
 
 Usage example:
     python brand_color_extractor.py https://example.com --output out.json --yes
-
-Doctest examples cover core parsing helpers:
 
 >>> normalize_hex('#0f0')
 '#00ff00'
@@ -32,6 +32,7 @@ import logging
 import os
 import random
 import re
+import socket
 import sys
 import time
 import urllib.parse
@@ -39,7 +40,7 @@ import urllib.request
 from html.parser import HTMLParser
 from typing import Dict, Iterable, List, Optional, Tuple
 
-USER_AGENT = "BrandPaletteExtractor/1.0"
+USER_AGENT = "BrandPaletteExtractor/1.1"
 MAX_REDIRECTS = 5
 CSS_COLOR_PROPS = {
     "color",
@@ -56,6 +57,22 @@ NAMED_COLORS = {
     "green": "#00ff00",
     "blue": "#0000ff",
 }
+PRIVATE_NETWORKS_V4 = [
+    ("127.0.0.0", 8),
+    ("10.0.0.0", 8),
+    ("172.16.0.0", 12),
+    ("192.168.0.0", 16),
+    ("169.254.0.0", 16),
+    ("0.0.0.0", 8),
+    ("100.64.0.0", 10),
+]
+PRIVATE_NETWORKS_V6 = [
+    ("::1", 128),
+    ("fc00::", 7),
+    ("fe80::", 10),
+]
+DEFAULT_MEMORY_DIR = os.path.expanduser("~/Downloads/Pal/.pipeline_memory/slide_decks/")
+LOCK_TTL_SECONDS = 300
 
 
 class LimitedHTMLParser(HTMLParser):
@@ -156,24 +173,31 @@ def parse_hsl(value: str) -> Optional[Tuple[int, int, int, float]]:
     s = max(0.0, min(100.0, float(m.group(2)))) / 100.0
     l = max(0.0, min(100.0, float(m.group(3)))) / 100.0
     a = float(m.group(4)) if m.group(4) is not None else 1.0
+
     def hue_to_rgb(p: float, q: float, t: float) -> float:
         t = t % 1
-        if t < 1/6:
+        if t < 1 / 6:
             return p + (q - p) * 6 * t
-        if t < 1/2:
+        if t < 1 / 2:
             return q
-        if t < 2/3:
-            return p + (q - p) * (2/3 - t) * 6
+        if t < 2 / 3:
+            return p + (q - p) * (2 / 3 - t) * 6
         return p
+
     if s == 0:
         r = g = b = int(l * 255)
     else:
         q = l * (1 + s) if l < 0.5 else l + s - l * s
         p = 2 * l - q
-        r = int(round(hue_to_rgb(p, q, h/360 + 1/3) * 255))
-        g = int(round(hue_to_rgb(p, q, h/360) * 255))
-        b = int(round(hue_to_rgb(p, q, h/360 - 1/3) * 255))
-    return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)), max(0.0, min(1.0, a)))
+        r = int(round(hue_to_rgb(p, q, h / 360 + 1 / 3) * 255))
+        g = int(round(hue_to_rgb(p, q, h / 360) * 255))
+        b = int(round(hue_to_rgb(p, q, h / 360 - 1 / 3) * 255))
+    return (
+        max(0, min(255, r)),
+        max(0, min(255, g)),
+        max(0, min(255, b)),
+        max(0.0, min(1.0, a)),
+    )
 
 
 def normalize_hex(value: str) -> Optional[str]:
@@ -184,6 +208,7 @@ def normalize_hex(value: str) -> Optional[str]:
     >>> normalize_hex('hsl(0, 100%, 50%)')
     '#ff0000'
     """
+
     value = value.strip()
     if not value:
         return None
@@ -207,335 +232,462 @@ def normalize_hex(value: str) -> Optional[str]:
     return None
 
 
-def choose_text_color(bg_hex: str, current_text: str) -> str:
-    """Choose black/white improving contrast.
-
-    >>> choose_text_color('#ffffff', '#000000')
-    '#000000'
-    """
-    bg_rgb = parse_hex_color(bg_hex) or (255, 255, 255)
-    txt_rgb = parse_hex_color(current_text) or (0, 0, 0)
-    black = relative_luminance((0, 0, 0))
-    white = relative_luminance((255, 255, 255))
-    bg_l = relative_luminance(bg_rgb)
-    def contrast(l1: float, l2: float) -> float:
-        a, b = max(l1, l2), min(l1, l2)
-        return (a + 0.05) / (b + 0.05)
-    black_contrast = contrast(bg_l, black)
-    white_contrast = contrast(bg_l, white)
-    current_contrast = contrast(bg_l, relative_luminance(txt_rgb))
-    if black_contrast >= white_contrast and black_contrast > current_contrast:
-        return "#000000"
-    if white_contrast > black_contrast and white_contrast > current_contrast:
-        return "#ffffff"
-    return "#%02x%02x%02x" % txt_rgb
+def choose_text_color(bg_hex: str, preferred: str) -> str:
+    bg = parse_hex_color(bg_hex) or (255, 255, 255)
+    preferred_rgb = parse_hex_color(preferred) or (0, 0, 0)
+    black = (0, 0, 0)
+    white = (255, 255, 255)
+    def contrast(c1: Tuple[int, int, int], c2: Tuple[int, int, int]) -> float:
+        l1 = relative_luminance(c1) + 0.05
+        l2 = relative_luminance(c2) + 0.05
+        return max(l1, l2) / min(l1, l2)
+    best = preferred_rgb
+    if contrast(bg, preferred_rgb) < 4.5:
+        best = black if contrast(bg, black) >= contrast(bg, white) else white
+    return "#%02x%02x%02x" % best
 
 
-def domain_from_url(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    return parsed.hostname or parsed.netloc
+def is_private_ip(hostname: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return True
+    for family, _, _, _, sockaddr in infos:
+        ip = sockaddr[0]
+        if family == socket.AF_INET:
+            if any(_in_cidr(ip, net, bits) for net, bits in PRIVATE_NETWORKS_V4):
+                return True
+        elif family == socket.AF_INET6:
+            if any(_in_cidr_v6(ip, net, bits) for net, bits in PRIVATE_NETWORKS_V6):
+                return True
+    return False
 
 
-def fetch_url(url: str, timeout: float, max_bytes: int) -> bytes:
-    """Fetch a URL with redirect, byte, and gzip safeguards."""
+def _in_cidr(ip: str, network: str, bits: int) -> bool:
+    import struct
+    import ipaddress
 
-    redirects = 0
-    current = url
-    while True:
-        req = urllib.request.Request(current, headers={"User-Agent": USER_AGENT})
-        with contextlib.closing(urllib.request.urlopen(req, timeout=timeout)) as resp:
-            if resp.geturl() != current and redirects >= MAX_REDIRECTS:
-                raise RuntimeError("Too many redirects")
-            if resp.geturl() != current:
-                redirects += 1
-                current = resp.geturl()
-                continue
-            data = []
-            total = 0
-            while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise RuntimeError(f"Response exceeds limit {max_bytes} bytes")
-                data.append(chunk)
-            raw = b"".join(data)
-            encoding = resp.headers.get("Content-Encoding", "").lower()
-            if encoding == "gzip":
-                with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
-                    decompressed = gz.read(max_bytes + 1)
-                    if len(decompressed) > max_bytes:
-                        raise RuntimeError(f"Decompressed response exceeds limit {max_bytes} bytes")
-                    return decompressed
-            return raw
+    mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+    ip_int = int(ipaddress.IPv4Address(ip))
+    net_int = int(ipaddress.IPv4Address(network))
+    return ip_int & mask == net_int & mask
 
 
-def parse_colors_from_css(css: str) -> List[Tuple[str, int]]:
-    results: List[Tuple[str, int]] = []
-    for var, value in re.findall(r"(--[\w-]+)\s*:\s*([^;]+)", css):
-        hex_value = normalize_hex(value.split()[0])
-        if hex_value:
-            weight = 5 if re.search(r"(primary|brand|main)", var, re.I) else 3 if re.search(r"(accent|secondary|highlight|bg|background|text|fg|foreground)", var, re.I) else 1
-            results.append((hex_value, weight))
-    for prop, value in re.findall(r"(color|background(?:-color)?|border-color|fill|stroke)\s*:\s*([^;]+)", css, flags=re.I):
-        hex_value = normalize_hex(value.split()[0])
-        if hex_value:
-            results.append((hex_value, 1))
-    return results
+def _in_cidr_v6(ip: str, network: str, bits: int) -> bool:
+    import ipaddress
+
+    ip_int = int(ipaddress.IPv6Address(ip))
+    net_int = int(ipaddress.IPv6Address(network))
+    mask = (1 << 128) - (1 << (128 - bits))
+    return ip_int & mask == net_int & mask
 
 
-def parse_inline_styles(styles: Iterable[str]) -> List[Tuple[str, int]]:
-    results: List[Tuple[str, int]] = []
-    for style in styles:
-        for prop, value in re.findall(r"(color|background(?:-color)?|border-color|fill|stroke)\s*:\s*([^;]+)", style, flags=re.I):
-            hex_value = normalize_hex(value.split()[0])
-            if hex_value:
-                results.append((hex_value, 2))
-    return results
+@dataclasses.dataclass
+class MemoryRecord:
+    company: str
+    url: str
+    domain: str
+    palette: Dict[str, Optional[str]]
+    theme: str
+    confidence: float
+    sources_used: List[str]
+    extracted_at: str
+    pipeline_version: str
+    memory_state_id: str
 
 
-def collect_sources(html: str) -> LimitedHTMLParser:
-    parser = LimitedHTMLParser()
-    parser.feed(html)
-    return parser
+class FileLock:
+    def __init__(self, path: str, ttl: int = LOCK_TTL_SECONDS) -> None:
+        self.path = path
+        self.ttl = ttl
+
+    def __enter__(self):
+        start = time.time()
+        while True:
+            if not os.path.exists(self.path):
+                try:
+                    data = {"pid": os.getpid(), "created_at": _utcnow()}
+                    tmp = self.path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, self.path)
+                    return self
+                except OSError:
+                    pass
+            else:
+                try:
+                    with open(self.path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    created = meta.get("created_at")
+                    if created and _is_stale(created, self.ttl):
+                        os.remove(self.path)
+                        continue
+                except Exception:
+                    try:
+                        os.remove(self.path)
+                        continue
+                    except OSError:
+                        pass
+            time.sleep(0.05)
+            if time.time() - start > self.ttl:
+                raise RuntimeError("Lock wait exceeded TTL")
+
+    def __exit__(self, exc_type, exc, tb):
+        with contextlib.suppress(OSError):
+            os.remove(self.path)
 
 
-def luminance_distance(hex1: str, hex2: str) -> float:
-    rgb1 = parse_hex_color(hex1) or (0, 0, 0)
-    rgb2 = parse_hex_color(hex2) or (0, 0, 0)
-    return sum(abs(a - b) for a, b in zip(rgb1, rgb2))
+def _is_stale(created_at: str, ttl: int) -> bool:
+    try:
+        ts = time.mktime(time.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return True
+    return (time.time() - ts) > ttl
 
 
-def is_neutral(hex_value: str) -> bool:
-    lum = relative_luminance(parse_hex_color(hex_value) or (0, 0, 0))
-    return lum > 0.95 or lum < 0.05
+def _utcnow() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def select_palette(weighted_colors: List[Tuple[str, int, str]]) -> Tuple[Dict[str, Optional[str]], str]:
-    scores: Dict[str, int] = {}
-    provenance: Dict[str, str] = {}
-    for color, weight, source in weighted_colors:
-        scores[color] = scores.get(color, 0) + weight
-        provenance.setdefault(color, source)
-    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    primary = None
-    secondary = None
-    accent = None
-    background = None
-    text = None
-    for color, _ in ordered:
-        if not primary and not is_neutral(color):
-            primary = color
-        elif primary and not secondary and not is_neutral(color) and luminance_distance(primary, color) >= 40:
-            secondary = color
-        elif primary and secondary and not accent and not is_neutral(color) and luminance_distance(primary, color) >= 40 and luminance_distance(secondary, color) >= 40:
-            accent = color
-    bg_candidates = [c for c in ordered if "bg" in provenance[c[0]] or "background" in provenance[c[0]]]
-    if bg_candidates:
-        background = bg_candidates[0][0]
-    else:
-        neutral_candidates = [c for c, _ in ordered if is_neutral(c)]
-        background = neutral_candidates[0] if neutral_candidates else (secondary or primary or "#ffffff")
-    if text is None:
-        text_candidates = [c for c in ordered if re.search(r"text|fg|foreground", provenance[c[0]], re.I)]
-        text = text_candidates[0][0] if text_candidates else choose_text_color(background or "#ffffff", "#000000")
-    palette = {
-        "primary": primary or background or "#000000",
-        "secondary": secondary or primary or background or "#000000",
-        "background": background or "#ffffff",
-        "text": text,
-        "accent": accent,
-    }
-    theme = "dark" if relative_luminance(parse_hex_color(palette["background"]) or (255, 255, 255)) < 0.35 else "light"
-    return palette, theme
-
-
-def compute_confidence(weighted_colors: List[Tuple[str, int, str]], palette: Dict[str, Optional[str]], has_theme_color: bool) -> float:
-    score = 0.2
-    primary = palette.get("primary")
-    primary_score = 0
-    secondary_score = 0
-    source_types = set()
-    for color, weight, source in weighted_colors:
-        source_types.add(source)
-        if color == primary:
-            primary_score += weight
-        if color == palette.get("secondary"):
-            secondary_score += weight
-    if primary and any(re.search(r"(primary|brand|main)", src, re.I) for _, _, src in weighted_colors if _ == primary):
-        score += 0.3
-    if has_theme_color:
-        score += 0.2
-    score += 0.1 * min(3, len(source_types))
-    ratio = primary_score / (secondary_score + 1e-9)
-    score += 0.2 * min(1.0, ratio / 3)
-    return max(0.0, min(1.0, score))
-
-
-def load_memory(memory_dir: str) -> Dict[str, object]:
-    path = os.path.join(memory_dir, "extracted_palettes_history.json")
-    if not os.path.exists(path):
-        return {"latest_by_domain": {}, "history": []}
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {"latest_by_domain": {}, "history": []}
-
-
-def atomic_write(path: str, data: str) -> None:
+def atomic_write_json(path: str, data: object) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(data)
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
 
-def with_lock(memory_dir: str):
-    lock_path = os.path.join(memory_dir, ".lock")
-    class Lock:
-        def __enter__(self):
-            try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
-            except FileExistsError:
-                raise RuntimeError("Memory lock is held; try again later")
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(lock_path)
-    return Lock()
-
-
-def save_memory(memory_dir: str, domain: str, record: Dict[str, object]) -> None:
-    os.makedirs(memory_dir, exist_ok=True)
-    data = load_memory(memory_dir)
-    data.setdefault("latest_by_domain", {})[domain] = record
-    data.setdefault("history", []).append(record)
-    payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
-    with with_lock(memory_dir):
-        atomic_write(os.path.join(memory_dir, "extracted_palettes_history.json"), payload)
-
-
-def extract_from_url(url: str, args: argparse.Namespace) -> Dict[str, object]:
+def fetch_url(url: str, timeout: int, max_bytes: int, allow_redirects: int = MAX_REDIRECTS) -> bytes:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"}:
-        raise RuntimeError("Only http/https URLs are allowed")
-    html_bytes = fetch_url(url, timeout=args.timeout, max_bytes=args.max_html_bytes)
-    html = html_bytes.decode("utf-8", errors="ignore")
-    parser = collect_sources(html)
-    weighted: List[Tuple[str, int, str]] = []
-    sources_used = []
-    for c in parser.meta_theme_color:
-        hex_value = normalize_hex(c)
-        if hex_value:
-            weighted.append((hex_value, 6, "meta"))
-            sources_used.append("meta")
-    if parser.style_blocks:
-        sources_used.append("style_block")
+        raise ValueError("Only http/https allowed")
+    if not parsed.hostname:
+        raise ValueError("Invalid URL: missing host")
+    if is_private_ip(parsed.hostname):
+        raise ValueError("Refusing to fetch private or link-local host")
+
+    seen = 0
+    current = url
+    while True:
+        if seen > allow_redirects:
+            raise ValueError("Too many redirects")
+        req = urllib.request.Request(current, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            if status in (301, 302, 303, 307, 308):
+                target = resp.getheader("Location")
+                if not target:
+                    raise ValueError("Redirect without Location header")
+                current = urllib.parse.urljoin(current, target)
+                parsed = urllib.parse.urlparse(current)
+                if parsed.scheme not in {"http", "https"}:
+                    raise ValueError("Redirected to non-http/https")
+                if not parsed.hostname or is_private_ip(parsed.hostname):
+                    raise ValueError("Redirected to private or invalid host")
+                seen += 1
+                continue
+            raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError("Response exceeds byte limit")
+            encoding = resp.getheader("Content-Encoding", "").lower()
+            if encoding == "gzip":
+                with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+                    raw = gz.read(max_bytes + 1)
+                    if len(raw) > max_bytes:
+                        raise ValueError("Decompressed response too large")
+            return raw
+
+
+def parse_html(content: bytes, encoding: str = "utf-8") -> LimitedHTMLParser:
+    parser = LimitedHTMLParser()
+    parser.feed(content.decode(encoding, errors="ignore"))
+    return parser
+
+
+def collect_colors(parser: LimitedHTMLParser) -> Dict[str, List[Tuple[str, int]]]:
+    colors: Dict[str, List[Tuple[str, int]]] = {}
+    for val in parser.meta_theme_color:
+        hex_val = normalize_hex(val)
+        if hex_val:
+            colors.setdefault(hex_val, []).append(("meta:theme-color", 6))
     for block in parser.style_blocks:
-        for color, w in parse_colors_from_css(block):
-            weighted.append((color, w, "style_block"))
-    if parser.inline_styles:
-        sources_used.append("inline")
-        for color, w in parse_inline_styles(parser.inline_styles):
-            weighted.append((color, w, "inline"))
-    origin = parsed.hostname
-    css_files = 0
-    for href in parser.links:
-        if css_files >= args.max_css_files:
+        for name, val in extract_css_vars(block):
+            hex_val = normalize_hex(val)
+            if hex_val:
+                weight = 5 if re.search(r"(primary|brand|main)", name, re.I) else 3 if re.search(r"(accent|secondary|highlight|bg|background|text|fg|foreground)", name, re.I) else 1
+                colors.setdefault(hex_val, []).append((f"css_var:{name}", weight))
+        for prop, val in extract_css_props(block):
+            hex_val = normalize_hex(val)
+            if hex_val:
+                colors.setdefault(hex_val, []).append((f"css_prop:{prop}", 1))
+    for inline in parser.inline_styles:
+        for prop, val in extract_inline_style(inline):
+            hex_val = normalize_hex(val)
+            if hex_val:
+                colors.setdefault(hex_val, []).append((f"inline:{prop}", 2))
+    return colors
+
+
+def extract_css_vars(css: str) -> List[Tuple[str, str]]:
+    return re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", css)
+
+
+def extract_css_props(css: str) -> List[Tuple[str, str]]:
+    pattern = r"(" + "|".join(map(re.escape, CSS_COLOR_PROPS)) + r")\s*:\s*([^;]+);"
+    return re.findall(pattern, css, flags=re.IGNORECASE)
+
+
+def extract_inline_style(style: str) -> List[Tuple[str, str]]:
+    parts = re.findall(r"([^:;]+):\s*([^;]+)", style)
+    return [(k.strip().lower(), v.strip()) for k, v in parts if k.strip().lower() in CSS_COLOR_PROPS]
+
+
+def fetch_stylesheets(base_url: str, links: List[str], args: argparse.Namespace) -> List[str]:
+    fetched: List[str] = []
+    base_host = urllib.parse.urlparse(base_url).hostname
+    for href in links:
+        if len(fetched) >= args.max_css_files:
             break
-        resolved = urllib.parse.urljoin(url, href)
-        parsed_css = urllib.parse.urlparse(resolved)
-        if parsed_css.scheme not in {"http", "https"}:
-            continue
-        host = urllib.parse.urlparse(resolved).hostname
+        resolved = urllib.parse.urljoin(base_url, href)
+        parsed = urllib.parse.urlparse(resolved)
+        host = parsed.hostname
         if not host:
             continue
-        if host != origin:
-            if not args.allow_css_cdn:
-                continue
-            allowlist = {h.strip().lower() for h in args.css_host_allowlist.split(',')} if args.css_host_allowlist else set()
-            if args.same_origin_css:
-                continue
-            if allowlist and host.lower() not in allowlist:
-                continue
-            if not allowlist:
-                continue
-        try:
-            css_bytes = fetch_url(resolved, timeout=args.timeout, max_bytes=args.max_css_bytes)
-            css_files += 1
-            css_text = css_bytes.decode("utf-8", errors="ignore")
-            sources_used.append("external_css")
-            for color, w in parse_colors_from_css(css_text):
-                weighted.append((color, w, "external_css"))
-        except Exception as exc:  # noqa: PERF203
-            logging.debug("Skipping CSS %s: %s", resolved, exc)
+        same_origin_allowed = args.same_origin_css
+        cross_allowed = args.allow_css_cdn and args.css_host_allowlist and host in args.css_host_allowlist and not args.same_origin_css
+        if not ((same_origin_allowed and host == base_host) or cross_allowed):
             continue
-    palette, theme = select_palette(weighted)
-    company = parser.meta_site_name or parser.meta_app_name or (parser.title or "").strip() or (origin or "")
-    extracted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    record = {
-        "company": company,
-        "url": url,
-        "domain": origin,
-        "palette": palette,
-        "theme": theme,
-        "confidence": compute_confidence(weighted, palette, bool(parser.meta_theme_color)),
-        "sources_used": sorted(set(sources_used)),
-        "extracted_at": extracted_at,
-    }
-    return record
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if is_private_ip(host):
+            continue
+        try:
+            raw = fetch_url(resolved, args.timeout, args.max_css_bytes)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Skip stylesheet %s: %s", resolved, exc)
+            continue
+        fetched.append(raw.decode("utf-8", errors="ignore"))
+    return fetched
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Extract brand palette from website")
+def weight_colors(colors: Dict[str, List[Tuple[str, int]]], external: Dict[str, List[Tuple[str, int]]]) -> Dict[str, List[Tuple[str, int]]]:
+    merged: Dict[str, List[Tuple[str, int]]] = {k: v[:] for k, v in colors.items()}
+    for hex_val, provs in external.items():
+        merged.setdefault(hex_val, []).extend(provs)
+    return merged
+
+
+def select_palette(weighted: Dict[str, List[Tuple[str, int]]]) -> Tuple[Dict[str, Optional[str]], float, List[str]]:
+    scores: Dict[str, int] = {c: sum(w for _, w in provs) for c, provs in weighted.items()}
+    sorted_colors = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    def prov_strings(hex_val: str) -> List[str]:
+        return [p for p, _ in weighted.get(hex_val, [])]
+
+    def is_neutral(hex_val: str) -> bool:
+        lum = relative_luminance(parse_hex_color(hex_val) or (0, 0, 0))
+        if lum > 0.95 or lum < 0.05:
+            tags = " ".join(prov_strings(hex_val)).lower()
+            if re.search(r"(text|fg|foreground|bg|background)", tags):
+                return False
+            return True
+        return False
+
+    chosen: Dict[str, Optional[str]] = {"primary": None, "secondary": None, "background": None, "text": None, "accent": None}
+    non_neutral = [c for c, _ in sorted_colors if not is_neutral(c)]
+    neutral = [c for c, _ in sorted_colors if is_neutral(c)]
+    if non_neutral:
+        chosen["primary"] = non_neutral[0]
+    def distinct(existing: str, candidate: str) -> bool:
+        a = parse_hex_color(existing)
+        b = parse_hex_color(candidate)
+        if not a or not b:
+            return False
+        return sum(abs(x - y) for x, y in zip(a, b)) >= 40
+    for c in non_neutral[1:]:
+        if chosen["primary"] and distinct(chosen["primary"], c):
+            chosen["secondary"] = c
+            break
+    if chosen["secondary"] is None:
+        for c in neutral:
+            if chosen["primary"] and distinct(chosen["primary"], c):
+                chosen["secondary"] = c
+                break
+    for c in non_neutral:
+        if chosen["primary"] and chosen["secondary"] and distinct(chosen["primary"], c) and distinct(chosen["secondary"], c):
+            chosen["accent"] = c
+            break
+    bg_candidates = [c for c in sorted_colors]
+    bg = None
+    for c, _ in bg_candidates:
+        if re.search(r"(bg|background)", " ".join(prov_strings(c)), re.I):
+            bg = c
+            break
+    if not bg:
+        bg = neutral[0] if neutral else (chosen["secondary"] or chosen["primary"])
+    chosen["background"] = bg
+    text = None
+    for c, _ in sorted_colors:
+        if re.search(r"(text|fg|foreground)", " ".join(prov_strings(c)), re.I):
+            text = c
+            break
+    if not text:
+        text = choose_text_color(chosen["background"] or "#ffffff", "#000000")
+    chosen["text"] = text
+
+    sources_used = set()
+    for provs in weighted.values():
+        for p, _ in provs:
+            if p.startswith("meta"):
+                sources_used.add("meta")
+            elif p.startswith("css_var") or p.startswith("css_prop"):
+                sources_used.add("style_block")
+            elif p.startswith("inline"):
+                sources_used.add("inline")
+            elif p.startswith("external_css"):
+                sources_used.add("external_css")
+    primary_provs = prov_strings(chosen["primary"] or "")
+    confidence = 0.2
+    if any(re.search(r"(primary|brand|main)", p, re.I) for p in primary_provs if p.startswith("css_var")):
+        confidence += 0.3
+    if any(p.startswith("meta:theme-color") for p in primary_provs):
+        confidence += 0.2
+    confidence += min(0.3, 0.1 * len(sources_used))
+    secondary_score = scores.get(chosen.get("secondary") or "", 0)
+    primary_score = scores.get(chosen.get("primary") or "", 0)
+    if secondary_score >= 0:
+        confidence += 0.2 * min(1.0, (primary_score / (secondary_score + 1e-9)) / 3)
+    confidence = max(0.0, min(1.0, confidence))
+    return chosen, confidence, sorted(sources_used)
+
+
+def resolve_company_name(parser: LimitedHTMLParser, domain: str) -> str:
+    if parser.meta_site_name:
+        return parser.meta_site_name.strip()
+    if parser.meta_app_name:
+        return parser.meta_app_name.strip()
+    if parser.title:
+        return parser.title.strip()
+    if domain:
+        label = domain.split(".")[0]
+        return label.capitalize()
+    return "Unknown"
+
+
+def load_memory(path: str) -> Dict[str, object]:
+    if not os.path.exists(path):
+        return {"latest_by_domain": {}, "history": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"latest_by_domain": {}, "history": []}
+
+
+def ensure_allowed_output(output: Optional[str], memory_dir: str) -> None:
+    if output is None:
+        return
+    abs_out = os.path.abspath(output)
+    allowed_roots = {os.path.abspath(os.getcwd()), os.path.abspath(memory_dir)}
+    if not any(abs_out.startswith(root + os.sep) or abs_out == root for root in allowed_roots):
+        raise SystemExit("Output path must be within current working directory or memory-dir")
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Extract brand colors without rendering HTML")
     parser.add_argument("url")
-    parser.add_argument("--output", help="Output JSON path")
+    parser.add_argument("--output")
     parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--timeout", type=float, default=10)
-    parser.add_argument("--max-html-bytes", dest="max_html_bytes", type=int, default=2_000_000)
-    parser.add_argument("--max-css-bytes", dest="max_css_bytes", type=int, default=1_000_000)
-    parser.add_argument("--max-css-files", dest="max_css_files", type=int, default=5)
+    parser.add_argument("--timeout", type=int, default=10)
+    parser.add_argument("--max-html-bytes", type=int, default=2_000_000)
+    parser.add_argument("--max-css-bytes", type=int, default=1_000_000)
+    parser.add_argument("--max-css-files", type=int, default=5)
     parser.add_argument("--same-origin-css", dest="same_origin_css", action="store_true", default=True)
     parser.add_argument("--no-same-origin-css", dest="same_origin_css", action="store_false")
-    parser.add_argument("--allow-css-cdn", dest="allow_css_cdn", action="store_true", default=False)
-    parser.add_argument("--css-host-allowlist", dest="css_host_allowlist", default="")
-    parser.add_argument("--memory-dir", dest="memory_dir", default=os.path.expanduser("~/Downloads/Pal/.pipeline_memory/slide_decks/"))
+    parser.add_argument("--allow-css-cdn", action="store_true")
+    parser.add_argument("--css-host-allowlist", type=lambda s: [h.strip() for h in s.split(",") if h.strip()], default=[])
+    parser.add_argument("--memory-dir", default=DEFAULT_MEMORY_DIR)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--yes", action="store_true", help="Perform network fetch and persist results")
     args = parser.parse_args(argv)
 
-    level = logging.INFO
-    if args.verbose:
-        level = logging.DEBUG
-    if args.quiet:
-        level = logging.ERROR
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.ERROR if args.quiet else logging.INFO, format="%(levelname)s:%(message)s")
 
-    domain = domain_from_url(args.url)
-    memory = load_memory(args.memory_dir)
+    ensure_allowed_output(args.output, args.memory_dir)
+
+    parsed_url = urllib.parse.urlparse(args.url)
+    if parsed_url.scheme not in {"http", "https"}:
+        raise SystemExit("Only http/https URLs are allowed")
+    domain = parsed_url.hostname or ""
+
+    mem_path = os.path.join(args.memory_dir, "extracted_palettes_history.json")
+    os.makedirs(args.memory_dir, exist_ok=True)
+    memory = load_memory(mem_path)
     cached = memory.get("latest_by_domain", {}).get(domain)
     if cached and not args.refresh:
-        record = cached
-    else:
-        record = extract_from_url(args.url, args)
-        try:
-            save_memory(args.memory_dir, domain, record)
-        except Exception as exc:  # noqa: PERF203
-            logging.error("Failed to save memory: %s", exc)
-    output_json = json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)
+        print(json.dumps(cached, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    plan = {
+        "action": "extract_palette",
+        "url": args.url,
+        "domain": domain,
+        "will_fetch": True,
+        "will_write_memory": bool(args.yes),
+        "will_write_output": bool(args.output and args.yes),
+    }
+    print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
+    if not args.yes:
+        return
+
+    html_bytes = fetch_url(args.url, args.timeout, args.max_html_bytes)
+    parser_obj = parse_html(html_bytes)
+    base_colors = collect_colors(parser_obj)
+    stylesheets = fetch_stylesheets(args.url, parser_obj.links, args)
+    external_colors: Dict[str, List[Tuple[str, int]]] = {}
+    for css in stylesheets:
+        for name, val in extract_css_vars(css):
+            hex_val = normalize_hex(val)
+            if hex_val:
+                weight = 5 if re.search(r"(primary|brand|main)", name, re.I) else 3 if re.search(r"(accent|secondary|highlight|bg|background|text|fg|foreground)", name, re.I) else 1
+                external_colors.setdefault(hex_val, []).append((f"external_css:css_var:{name}", weight))
+        for prop, val in extract_css_props(css):
+            hex_val = normalize_hex(val)
+            if hex_val:
+                external_colors.setdefault(hex_val, []).append((f"external_css:{prop}", 1))
+
+    weighted = weight_colors(base_colors, external_colors)
+    palette, confidence, sources_used = select_palette(weighted)
+    bg_rgb = parse_hex_color(palette["background"] or "#ffffff") or (255, 255, 255)
+    theme = "dark" if relative_luminance(bg_rgb) < 0.35 else "light"
+    record = {
+        "company": resolve_company_name(parser_obj, domain),
+        "url": args.url,
+        "domain": domain,
+        "palette": palette,
+        "theme": theme,
+        "confidence": round(confidence, 3),
+        "sources_used": sources_used,
+        "extracted_at": _utcnow(),
+        "pipeline_version": "3.0",
+        "memory_state_id": _uuid4(),
+    }
+
     if args.output:
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-            atomic_write(args.output, output_json)
-        except Exception as exc:  # noqa: PERF203
-            print(f"Error writing output: {exc}", file=sys.stderr)
-            return 1
-    else:
-        print(output_json)
-    return 0
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2, sort_keys=True)
+    with FileLock(mem_path + ".lock"):
+        memory = load_memory(mem_path)
+        memory.setdefault("latest_by_domain", {})[domain] = record
+        memory.setdefault("history", []).append(record)
+        atomic_write_json(mem_path, memory)
+    print(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+def _uuid4() -> str:
+    import uuid
+
+    return str(uuid.uuid4())
+
+
+if __name__ == "__main__":
+    main()

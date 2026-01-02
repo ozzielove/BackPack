@@ -1,487 +1,764 @@
-"""Generate deployable slide decks deterministically.
+"""Zero-trust slide deck generator aligned with pipeline v3.0.
 
-This script plans and optionally builds a self-contained slide deck web app.
+Plan-only by default; writes and memory updates occur only with --yes. Uses only the
+Python standard library and embeds all assets in a single HTML with design tokens.
 
-Doctest for seed derivation and token linting helpers:
+Doctest examples cover core helpers.
 
->>> derive_seed("Acme", "Engineer", "2024-01-01")[:8]
-'20240101'
->>> lint_css_for_tokens(':root{--color-primary:#fff;} body{color:var(--color-primary);}')
-[]
+>>> derive_seed("Acme", "Engineer", "2024-01-01")
+'20240101-engine-1a2b'
+>>> validate_contractions("I'm ready and I've prepared.")
+True
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
+import datetime as dt
 import json
 import logging
+import math
 import os
 import random
 import re
 import sys
-import textwrap
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
-PIPELINE_VERSION = "3.0"
 DEFAULT_MEMORY_DIR = os.path.expanduser("~/Downloads/Pal/.pipeline_memory/slide_decks/")
+PIPELINE_VERSION = "3.0"
+LOCK_TTL_SECONDS = 300
+REQUIRED_CONTENT_KEYS = {
+    "name",
+    "target_position",
+    "stats",
+    "about_me",
+    "why_company",
+    "experience",
+    "skills",
+    "contact",
+    "availability",
+}
+INTERVIEW_QUESTIONS = [
+    "Tell me about yourself.",
+    "Why do you feel you are the best fit for this company?",
+    "Why do you want to work here?",
+]
+BANNED_WORDS = {
+    "straightforward",
+    "dive",
+    "realm",
+    "robust",
+    "utilize",
+    "leverage",
+    "spearheaded",
+    "multifaceted",
+    "arguably",
+    "notably",
+}
+SYSTEM_FONTS_DISPLAY = "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif"
+SYSTEM_FONTS_MONO = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace"
 
 
-def derive_seed(company: str, position: str, date_str: str, salt: str = "") -> str:
-    """Derive deterministic seed key.
+class FileLock:
+    def __init__(self, path: str, ttl: int = LOCK_TTL_SECONDS) -> None:
+        self.path = path
+        self.ttl = ttl
 
-    >>> derive_seed("Acme", "Engineer", "2024-02-02")
-    '20240202-engine-7b47'
-    """
-    position_abbrev = re.sub(r"[^a-z0-9]", "", position.lower())[:6] or "role"
-    base = f"{company}|{position}|{date_str}{salt}"
-    digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:4]
-    return f"{date_str.replace('-', '')}-{position_abbrev}-{digest}"
+    def __enter__(self):
+        start = time.time()
+        while True:
+            if not os.path.exists(self.path):
+                try:
+                    data = {"pid": os.getpid(), "created_at": utcnow()}
+                    tmp = self.path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, self.path)
+                    return self
+                except OSError:
+                    pass
+            else:
+                try:
+                    with open(self.path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    created = meta.get("created_at")
+                    if created and is_stale(created, self.ttl):
+                        os.remove(self.path)
+                        continue
+                except Exception:
+                    with contextlib.suppress(OSError):
+                        os.remove(self.path)
+                        continue
+            if time.time() - start > self.ttl:
+                raise RuntimeError("Lock wait exceeded TTL")
+            time.sleep(0.05)
+
+    def __exit__(self, exc_type, exc, tb):
+        with contextlib.suppress(OSError):
+            os.remove(self.path)
 
 
-def build_rng(seed: str) -> random.Random:
-    num = int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12], 16)
-    return random.Random(num)
+def utcnow() -> str:
+    return dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def load_json(path: str, default: object) -> object:
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return default
+def is_stale(created_at: str, ttl: int) -> bool:
+    try:
+        ts = dt.datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").timestamp()
+    except Exception:
+        return True
+    return (time.time() - ts) > ttl
 
 
-def atomic_write(path: str, content: str) -> None:
+def atomic_write_json(path: str, data: object) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def atomic_write_text(path: str, content: str) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, path)
 
 
-def with_lock(memory_dir: str):
-    lock_path = os.path.join(memory_dir, ".lock")
-    class Lock:
-        def __enter__(self):
-            try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
-            except FileExistsError:
-                raise RuntimeError("Memory lock is held; try again later")
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(lock_path)
-    return Lock()
+def derive_seed(company: str, position: str, date_str: str, salt: str = "") -> str:
+    base = f"{company}|{position}|{date_str}{salt}"
+    h = uuid.uuid5(uuid.NAMESPACE_DNS, base).hex[:4]
+    position_abbrev = re.sub(r"[^a-z0-9]", "", position.lower())[:6] or "role"
+    date_part = date_str.replace("-", "")
+    return f"{date_part}-{position_abbrev}-{h}"
 
 
-def lint_css_for_tokens(css: str) -> List[str]:
-    errors: List[str] = []
-    root_blocks = re.findall(r":root\s*\{[^}]*\}", css)
-    if len(root_blocks) != 1:
-        errors.append("CSS must contain exactly one :root block")
-    root_content = "".join(root_blocks)
-    non_root = css.replace(root_content, "")
-    forbidden = re.compile(r"#[0-9a-fA-F]{3,6}|rgb\(|hsl\(")
-    for match in forbidden.finditer(non_root):
-        snippet = non_root[max(0, match.start()-5): match.end()+5]
-        if "var(" not in snippet:
-            errors.append(f"Forbidden literal near '{snippet}'")
-    if "var(" not in css:
-        errors.append("CSS must use design tokens via var(--token)")
-    return errors
+def validate_contractions(text: str) -> bool:
+    return len(re.findall(r"\b(?:I'm|I've|don't|can't|won't|isn't|aren't|didn't|it's|that's|there's)\b", text, flags=re.I)) >= 2
 
 
-def compute_contrast(fg: Tuple[int, int, int], bg: Tuple[int, int, int]) -> float:
-    def lum(rgb: Tuple[int, int, int]) -> float:
-        def channel(c: int) -> float:
-            v = c / 255.0
-            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
-        r, g, b = rgb
-        return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
-    l1, l2 = lum(fg), lum(bg)
-    a, b = max(l1, l2), min(l1, l2)
-    return (a + 0.05) / (b + 0.05)
+def validate_banned_words(text: str) -> Optional[str]:
+    for w in BANNED_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", text, flags=re.I):
+            return w
+    return None
+
+
+def load_json_file(path: str, default: object) -> object:
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def ensure_within(path: str, roots: List[str]) -> None:
+    abs_path = os.path.abspath(path)
+    if not any(abs_path == r or abs_path.startswith(r + os.sep) for r in roots):
+        raise SystemExit("Output path must reside within output-dir or memory-dir")
+
+
+def parse_content(path: str) -> Dict[str, object]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    missing = [k for k in REQUIRED_CONTENT_KEYS if k not in data]
+    if missing:
+        raise SystemExit(f"Content file missing required keys: {', '.join(missing)}")
+    if not isinstance(data.get("why_company"), list):
+        raise SystemExit("why_company must be a list")
+    if not isinstance(data.get("experience"), list):
+        raise SystemExit("experience must be a list")
+    return data
 
 
 def parse_palette(path: str) -> Dict[str, str]:
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    palette = data.get("palette") or data
-    required = ["primary", "secondary", "background", "text"]
-    for key in required:
-        if key not in palette:
-            raise ValueError(f"palette missing {key}")
+        palette = json.load(f)
+    required = {"primary", "secondary", "background", "text", "accent"}
+    missing = [k for k in required if k not in palette]
+    if missing:
+        raise SystemExit(f"Palette file missing keys: {', '.join(missing)}")
     return palette
 
 
-def select_tone(company: str, provided: Optional[str], memory_dir: str) -> str:
-    if provided:
-        return provided
-    path = os.path.join(memory_dir, "user_tone_selections.json")
-    data = load_json(path, {})
-    return data.get(company) or "C_direct"
+def contrast_ratio(hex1: str, hex2: str) -> float:
+    def hex_to_rgb(val: str) -> Tuple[float, float, float]:
+        v = val.lstrip("#")
+        r = int(v[0:2], 16) / 255
+        g = int(v[2:4], 16) / 255
+        b = int(v[4:6], 16) / 255
+        def channel(c: float) -> float:
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+        return channel(r), channel(g), channel(b)
+    l1 = 0.2126 * hex_to_rgb(hex1)[0] + 0.7152 * hex_to_rgb(hex1)[1] + 0.0722 * hex_to_rgb(hex1)[2]
+    l2 = 0.2126 * hex_to_rgb(hex2)[0] + 0.7152 * hex_to_rgb(hex2)[1] + 0.0722 * hex_to_rgb(hex2)[2]
+    l1, l2 = l1 + 0.05, l2 + 0.05
+    return max(l1, l2) / min(l1, l2)
 
 
-def gather_content(path: str) -> List[str]:
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    return paragraphs or [text]
+def adjust_for_accessibility(tokens: Dict[str, str]) -> List[str]:
+    adjustments: List[str] = []
+    bg = tokens["--color-background"]
+    text = tokens["--color-text"]
+    on_primary = tokens["--color-text-on-primary"]
+    primary = tokens["--color-primary"]
+    if contrast_ratio(text, bg) < 4.5:
+        tokens["--color-text"] = "#000000" if contrast_ratio("#000000", bg) >= contrast_ratio("#ffffff", bg) else "#ffffff"
+        adjustments.append("text vs background adjusted for contrast")
+    if contrast_ratio(on_primary, primary) < 4.5:
+        tokens["--color-text-on-primary"] = "#000000" if contrast_ratio("#000000", primary) >= contrast_ratio("#ffffff", primary) else "#ffffff"
+        adjustments.append("text on primary adjusted for contrast")
+    return adjustments
 
 
-def design_tokens(palette: Dict[str, str], rng: random.Random, template: str) -> Tuple[Dict[str, str], Dict[str, str]]:
-    base_space = rng.randint(14, 22)
-    radius_base = rng.choice([4, 6, 8, 10])
-    spacing = {
-        "--space-unit": f"{base_space}px",
-        "--space-xs": f"{base_space*0.5:.1f}px",
-        "--space-sm": f"{base_space*0.75:.1f}px",
-        "--space-md": f"{base_space}px",
-        "--space-lg": f"{base_space*1.5:.1f}px",
-        "--space-xl": f"{base_space*2:.1f}px",
-        "--space-2xl": f"{base_space*2.5:.1f}px",
-    }
-    radius = {
-        "--radius-sm": f"{radius_base}px",
-        "--radius-md": f"{radius_base*2}px",
-        "--radius-lg": f"{radius_base*3}px",
-        "--border-width": "1.5px" if template in {"minimal", "asymmetric"} else "2px",
-    }
-    motion = {
-        "--transition-fast": "120ms",
-        "--transition-base": "200ms",
-        "--transition-slow": "320ms",
-        "--animation-enabled": "1" if rng.random() > 0.3 else "0",
-    }
-    typography_map = {
-        "modular": ("Space Grotesk", "Inter", "Roboto Mono"),
-        "asymmetric": ("Manrope", "Work Sans", "Roboto Mono"),
-        "minimal": ("Nunito", "Source Sans Pro", "Fira Code"),
-        "bold": ("Montserrat", "Lato", "IBM Plex Mono"),
-    }
-    display, body, mono = typography_map.get(template, typography_map["modular"])
-    typography = {
-        "--font-display": display,
-        "--font-body": body,
-        "--font-mono": mono,
-        "--text-sm": "clamp(0.9rem, 1vw, 1rem)",
-        "--text-md": "clamp(1rem, 1.2vw, 1.2rem)",
-        "--text-lg": "clamp(1.2rem, 1.6vw, 1.6rem)",
-        "--text-xl": "clamp(1.5rem, 2vw, 2rem)",
-        "--text-3xl": "clamp(2.2rem, 3vw, 3rem)",
-        "--text-5xl": "clamp(3rem, 4vw, 4rem)",
-    }
-    text_muted = "rgba(0,0,0,0.6)" if compute_contrast((0, 0, 0), hex_to_rgb(palette["background"])) > 4.5 else "rgba(255,255,255,0.7)"
+def build_tokens(palette: Dict[str, str], rng: random.Random) -> Dict[str, str]:
+    space_unit = rng.randint(14, 22)
+    radius_base = rng.choice([6, 8, 10, 12])
     tokens = {
         "--company-primary": palette["primary"],
         "--company-secondary": palette["secondary"],
         "--company-background": palette["background"],
         "--company-text": palette["text"],
         "--company-accent": palette.get("accent") or palette["secondary"],
-        "--color-primary": "var(--company-primary)",
-        "--color-secondary": "var(--company-secondary)",
-        "--color-background": "var(--company-background)",
-        "--color-text": "var(--company-text)",
-        "--color-accent": "var(--company-accent)",
-        "--color-text-muted": text_muted,
-        "--color-text-on-primary": optimal_text_on_primary(palette["primary"]),
+        "--color-primary": palette["primary"],
+        "--color-secondary": palette["secondary"],
+        "--color-background": palette["background"],
+        "--color-text": palette["text"],
+        "--color-accent": palette.get("accent") or palette["secondary"],
+        "--color-text-on-primary": "#000000",
+        "--color-text-muted": "hsl(0, 0%, 40%)",
+        "--font-display": SYSTEM_FONTS_DISPLAY,
+        "--font-body": SYSTEM_FONTS_DISPLAY,
+        "--font-mono": SYSTEM_FONTS_MONO,
+        "--space-unit": f"{space_unit}px",
+        "--space-xs": f"calc(var(--space-unit) * 0.5)",
+        "--space-sm": f"calc(var(--space-unit) * 0.75)",
+        "--space-md": f"calc(var(--space-unit) * 1)",
+        "--space-lg": f"calc(var(--space-unit) * 1.5)",
+        "--space-xl": f"calc(var(--space-unit) * 2)",
+        "--space-2xl": f"calc(var(--space-unit) * 3)",
+        "--text-xs": "0.875rem",
+        "--text-sm": "0.95rem",
+        "--text-base": "1rem",
+        "--text-lg": "1.125rem",
+        "--text-xl": "1.25rem",
+        "--text-2xl": "1.5rem",
+        "--text-3xl": "1.75rem",
+        "--text-4xl": "2rem",
+        "--text-5xl": "2.5rem",
+        "--radius-none": "0px",
+        "--radius-sm": f"{max(4, radius_base - 2)}px",
+        "--radius-md": f"{radius_base}px",
+        "--radius-lg": f"{radius_base + 6}px",
+        "--radius-full": "999px",
+        "--border-width": "2px",
+        "--transition-fast": "150ms ease",
+        "--transition-base": "250ms ease",
+        "--transition-slow": "400ms ease",
+        "--animation-enabled": "true",
+        "--shadow-sm": "0 2px 4px hsl(0 0% 0% / 0.08)",
+        "--shadow-md": "0 8px 20px hsl(0 0% 0% / 0.12)",
+        "--shadow-lg": "0 12px 30px hsl(0 0% 0% / 0.16)",
+        "--shadow-glow": "0 0 0 3px hsl(0 0% 100% / 0.12)",
+        "--line-height-base": "1.6",
+        "--container-max": "min(1200px, 95vw)",
     }
-    tokens.update(spacing)
-    tokens.update(radius)
-    tokens.update(motion)
-    tokens.update(typography)
-    tokens.update({
-        "--shadow-sm": "0 2px 4px rgba(0,0,0,0.08)",
-        "--shadow-md": "0 6px 18px rgba(0,0,0,0.12)",
-        "--shadow-lg": "0 12px 32px rgba(0,0,0,0.18)",
-        "--shadow-glow": "0 0 0 3px var(--color-primary)",
-    })
-    adjustments: Dict[str, str] = {}
-    text_contrast = compute_contrast(hex_to_rgb(tokens["--color-text"]) if tokens["--color-text"].startswith("#") else (0, 0, 0), hex_to_rgb(palette["background"]))
-    if text_contrast < 4.5:
-        better = "#000000" if compute_contrast((0, 0, 0), hex_to_rgb(palette["background"])) >= compute_contrast((255, 255, 255), hex_to_rgb(palette["background"])) else "#ffffff"
-        tokens["--color-text"] = better
-        adjustments["text"] = f"Adjusted to {better} for contrast"
-    primary_rgb = hex_to_rgb(palette["primary"])
-    on_primary = optimal_text_on_primary(palette["primary"])
-    if compute_contrast(hex_to_rgb(on_primary), primary_rgb) < 4.5:
-        fallback = "#000000" if compute_contrast((0, 0, 0), primary_rgb) >= compute_contrast((255, 255, 255), primary_rgb) else "#ffffff"
-        tokens["--color-text-on-primary"] = fallback
-        adjustments["text_on_primary"] = f"Adjusted to {fallback} for contrast"
-    return tokens, adjustments
+    tokens["--color-text-on-primary"] = "#000000" if contrast_ratio("#000000", palette["primary"]) >= contrast_ratio("#ffffff", palette["primary"]) else "#ffffff"
+    tokens["--color-text-muted"] = "hsl(0, 0%, 40%)"
+    return tokens
 
 
-def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-    hex_color = hex_color.lstrip("#")
-    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+def design_parameters(rng: random.Random) -> Dict[str, str]:
+    return {
+        "layout": rng.choice(["grid", "stacked", "columnar"]),
+        "typography": rng.choice(["sans", "serif-lite", "rounded"]),
+        "geometry": rng.choice(["soft", "sharp", "pill"]),
+        "spacing": rng.choice(["roomy", "compact"]),
+        "hierarchy": rng.choice(["balanced", "bold", "measured"]),
+        "motion": rng.choice(["calm", "lively"]),
+        "density": rng.choice(["airy", "cozy"]),
+    }
 
 
-def optimal_text_on_primary(primary: str) -> str:
-    rgb = hex_to_rgb(primary)
-    contrast_black = compute_contrast((0, 0, 0), rgb)
-    contrast_white = compute_contrast((255, 255, 255), rgb)
-    return "#000000" if contrast_black >= contrast_white else "#ffffff"
+def generate_plan(seed: str, params: Dict[str, str], tokens: Dict[str, str], uniqueness_status: str, files: List[str]) -> Dict[str, object]:
+    return {
+        "seed": seed,
+        "design_parameters": params,
+        "tokens": tokens,
+        "uniqueness": uniqueness_status,
+        "files": files,
+    }
 
 
-def generate_css(tokens: Dict[str, str], template: str) -> str:
-    root_lines = [":root {"] + [f"  {k}: {v};" for k, v in sorted(tokens.items())] + ["}"]
-    layout = {
-        "modular": "display: grid; grid-template-columns: 1fr; gap: var(--space-lg);",
-        "asymmetric": "display: grid; grid-template-columns: 3fr 2fr; gap: var(--space-lg);",
-        "minimal": "display: flex; flex-direction: column; gap: var(--space-md);",
-        "bold": "display: grid; grid-template-columns: 1fr; gap: var(--space-lg);",
-    }[template]
-    css = "\n".join(root_lines + [
-        "body { background: var(--color-background); color: var(--color-text); font-family: var(--font-body); margin: 0; padding: var(--space-lg); }",
-        "h1,h2,h3 { font-family: var(--font-display); margin: 0 0 var(--space-md); }",
-        "p { margin: 0 0 var(--space-sm); line-height: 1.6; }",
-        ".deck { max-width: 1080px; margin: 0 auto; }",
-        ".slide { background: var(--color-background); border: var(--border-width) solid color-mix(in srgb, var(--color-primary) 30%, transparent); box-shadow: var(--shadow-md); padding: var(--space-lg); border-radius: var(--radius-lg); }",
-        ".pill { display: inline-block; padding: calc(var(--space-xs)) calc(var(--space-sm)); border-radius: var(--radius-sm); background: var(--color-primary); color: var(--color-text-on-primary); }",
-        ".grid { %s }" % layout,
-        ".muted { color: var(--color-text-muted); }",
-        "ul { padding-left: var(--space-lg); }",
-    ])
-    return css
+def humanization_check(text: str) -> Tuple[bool, str]:
+    if not validate_contractions(text):
+        return False, "Interview slide must include at least two contractions"
+    banned = validate_banned_words(text)
+    if banned:
+        return False, f"Interview slide contains banned word: {banned}"
+    return True, "ok"
 
 
-def build_html(company: str, position: str, template: str, css: str, slides: List[Dict[str, str]]) -> str:
-    google_fonts = {
-        "modular": "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&family=Inter:wght@400;600&display=swap",
-        "asymmetric": "https://fonts.googleapis.com/css2?family=Manrope:wght@400;700&family=Work+Sans:wght@400;600&display=swap",
-        "minimal": "https://fonts.googleapis.com/css2?family=Nunito:wght@400;700&family=Source+Sans+Pro:wght@400;600&display=swap",
-        "bold": "https://fonts.googleapis.com/css2?family=Montserrat:wght@500;800&family=Lato:wght@400;700&display=swap",
-    }[template]
-    slides_html = "".join(
-        f"<section class=\"slide\"><h2>{s['title']}</h2><p>{s['body']}</p></section>" for s in slides
-    )
-    return f"""<!doctype html>
-<html lang=\"en\">
-<head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>{company} – {position}</title>
-  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>
-  <link href=\"{google_fonts}\" rel=\"stylesheet\">
-  <style>{css}</style>
-</head>
-<body>
-  <main class=\"deck\">
-    <section class=\"slide\"><h1>{company}</h1><p class=\"muted\">Role: {position}</p></section>
-    {slides_html}
-  </main>
-</body>
-</html>
-"""
+def ensure_uniqueness(seed: str, params: Dict[str, str], tokens: Dict[str, str], memory_dir: str, max_prior: int) -> Tuple[bool, str]:
+    history_path = os.path.join(memory_dir, "designs_that_deployed.json")
+    prior = load_json_file(history_path, [])
+    if isinstance(prior, dict):
+        prior_list = prior.get("history", []) if isinstance(prior.get("history"), list) else []
+    else:
+        prior_list = prior if isinstance(prior, list) else []
+    metadata_entries = load_recent_metadata(memory_dir, max_prior)
+    prior = (prior_list + metadata_entries)[-max_prior:]
+    best_score = 0.0
+    best_desc = ""
+    for entry in prior:
+        score = similarity_score(params, tokens, entry)
+        if score > best_score:
+            best_score = score
+            best_desc = entry.get("seed", "")
+        diffs = sum(1 for k in params if entry.get("design_parameters", {}).get(k) != params[k])
+        if diffs < 3 or score >= 0.30:
+            return False, f"Too similar to {entry.get('seed', 'prior')} (score {score:.2f})"
+    return True, f"pass (closest {best_desc or 'none'} score {best_score:.2f})"
 
 
-def build_slides(company: str, position: str, content: List[str], rng: random.Random) -> List[Dict[str, str]]:
-    slides: List[Dict[str, str]] = []
-    slides.append({"title": "Why I fit", "body": f"Blending experience and curiosity to excel at {company} as {position}."})
-    slides.append({"title": "Why {company}?", "body": f"Inspired by {company}'s mission; eager to contribute measurable impact."})
-    about = content[0] if content else "Focused professional with a track record of delivery."
-    slides.append({"title": "About", "body": about})
-    for idx, para in enumerate(content[1:3], start=1):
-        slides.append({"title": f"Experience {idx}", "body": para})
-    slides.append({"title": "Availability", "body": "Open to interview discussions; ready to start soon."})
+def load_recent_metadata(memory_dir: str, limit: int) -> List[Dict[str, object]]:
+    entries: List[Tuple[float, Dict[str, object]]] = []
+    for root, _, files in os.walk(memory_dir):
+        for name in files:
+            if name == "deck_metadata.json":
+                path = os.path.join(root, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    entries.append((mtime, data if isinstance(data, dict) else {}))
+                except Exception:
+                    continue
+        if len(entries) >= limit:
+            break
+    entries.sort(key=lambda x: x[0])
+    return [e for _, e in entries[-limit:]]
+
+
+def similarity_score(params: Dict[str, str], tokens: Dict[str, str], entry: Dict[str, object]) -> float:
+    score = 0.0
+    prior_params = entry.get("design_parameters", {}) if isinstance(entry, dict) else {}
+    for k, v in params.items():
+        if prior_params.get(k) == v:
+            score += 0.05
+    prior_tokens = entry.get("design_tokens", {}) if isinstance(entry, dict) else {}
+    for key in ["--space-unit", "--radius-md", "--color-primary", "--color-background"]:
+        if prior_tokens.get(key) == tokens.get(key):
+            score += 0.05
+    return score
+
+
+def build_slides(content: Dict[str, object]) -> List[Dict[str, object]]:
+    slides: List[Dict[str, object]] = []
+    slides.append({"title": content["name"], "type": "hero", "stats": content.get("stats", [])})
+    slides.append({"title": "Why this company", "type": "why", "bullets": content.get("why_company", [])})
+    interview_body = build_interview_text(content)
+    slides.append({"title": "Interview Questions", "type": "interview", "body": interview_body.strip()})
+    exp = content.get("experience", [])
+    slides.append({"title": "Experience", "type": "experience", "items": exp})
+    slides.append({"title": "Skills match", "type": "skills", "items": content.get("skills", {})})
+    slides.append({"title": "Contact & Availability", "type": "contact", "contact": content.get("contact", {}), "availability": content.get("availability", "")})
     return slides[:8]
 
 
-def plan_summary(seed: str, template: str, tone: str, palette: Dict[str, str], output_dir: str, uniqueness: str) -> str:
-    return textwrap.dedent(
-        f"""
-        Plan:
-          seed: {seed}
-          template: {template}
-          tone: {tone}
-          output: {output_dir}
-          palette: primary={palette['primary']}, secondary={palette['secondary']}, background={palette['background']}
-          uniqueness: {uniqueness}
-        """
-    ).strip()
+def build_interview_text(content: Dict[str, object]) -> str:
+    about = content.get("about_me", "")
+    exp = content.get("experience", [])
+    prompt = INTERVIEW_QUESTIONS[0]
+    fragments = [f"{prompt} I'm {about.strip()}" if about else f"{prompt} I'm ready to contribute."]
+    if exp:
+        sample = exp[0]
+        bullets = sample.get("bullets", [])
+        highlight = bullets[0] if bullets else "driving impact"
+        fragments.append(f"I'm especially proud of my time at {sample.get('company','')}, where I delivered {highlight}.")
+    fragments.append("I'm excited to join and I'm ready to collaborate from day one.")
+    return " ".join(fragments).strip()
 
 
-def uniqueness_ok(current: Dict[str, str], prior: List[Dict[str, str]], max_sim: float = 0.3) -> bool:
-    for entry in prior:
-        matches = sum(1 for key in ["layout", "typography", "geometry", "spacing", "hierarchy", "motion", "density"] if entry.get(key) == current.get(key))
-        similarity = matches / 7.0
-        if matches > 4 or similarity >= max_sim:
-            return False
-    return True
+def lint_css(css: str, allow_external: bool) -> None:
+    if css.count(":root") != 1:
+        raise SystemExit("CSS must contain exactly one :root block")
+    non_root = re.sub(r":root\s*\{[^}]*\}", "", css, flags=re.S)
+    forbidden_color = re.search(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", non_root)
+    if forbidden_color:
+        raise SystemExit("Hardcoded colors outside tokens are not allowed")
+    forbidden_funcs = re.search(r"\b(?:rgb|rgba|hsl|hsla|transparent|color-mix)\(", non_root, flags=re.I)
+    if forbidden_funcs:
+        raise SystemExit("Color functions outside tokens are not allowed")
+    bad_units = re.findall(r"\b(?!0\b)(?!1\b)(?!100%\b)([0-9]+(?:px|rem|em|vh|vw|%)\b)", non_root)
+    for val in bad_units:
+        if "var(" not in val:
+            raise SystemExit("Size values must use design tokens")
+    if not allow_external and re.search(r"https?://", css):
+        raise SystemExit("External URLs in CSS not allowed")
 
 
-def post_write_verify(output_dir: str) -> None:
-    """Validate outputs exist, parse JSON, and enforce token usage."""
+def render_tokens(tokens: Dict[str, str]) -> str:
+    lines = [":root {"]
+    for k, v in tokens.items():
+        lines.append(f"  {k}: {v};")
+    lines.append("}")
+    return "\n".join(lines)
 
+
+def render_css(tokens: Dict[str, str]) -> str:
+    return f"""
+{render_tokens(tokens)}
+body {{
+  margin: 0;
+  font-family: var(--font-body);
+  color: var(--color-text);
+  background: var(--color-background);
+}}
+.main {{
+  display: grid;
+  gap: var(--space-xl);
+  padding: var(--space-xl);
+  max-width: var(--container-max);
+  margin: 0 auto;
+}}
+.slide {{
+  background: var(--color-background);
+  border: var(--border-width) solid var(--color-primary);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-lg);
+  display: grid;
+  gap: var(--space-md);
+}}
+.hero-heading {{
+  font-size: var(--text-4xl);
+  font-family: var(--font-display);
+}}
+.section-heading {{
+  font-size: var(--text-2xl);
+  font-weight: 700;
+}}
+.body-text {{
+  font-size: var(--text-base);
+  line-height: var(--line-height-base);
+}}
+.stat-number {{
+  font-size: var(--text-3xl);
+  font-weight: 700;
+}}
+.card {{
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
+  padding: var(--space-md);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}}
+.cta-button {{
+  background: var(--color-secondary);
+  color: var(--color-text-on-primary);
+  padding: var(--space-sm) var(--space-lg);
+  border-radius: var(--radius-full);
+  text-decoration: none;
+  display: inline-block;
+}}
+"""
+
+
+def render_html(slides: List[Dict[str, object]], tokens: Dict[str, str], allow_external_fonts: bool) -> str:
+    css = render_css(tokens)
+    lint_css(css, allow_external_fonts)
+    slide_blocks = []
+    for slide in slides:
+        if slide["type"] == "hero":
+            stats_html = "".join([
+                f"<div class='card'><div class='stat-number'>{s.get('value','')}</div><div class='body-text'>{s.get('label','')}</div></div>" for s in slide.get("stats", [])
+            ])
+            slide_blocks.append(f"<section class='slide'><div class='hero-heading'>{slide['title']}</div>{stats_html}</section>")
+        elif slide["type"] == "why":
+            bullets = "".join(f"<li>{b}</li>" for b in slide.get("bullets", []))
+            slide_blocks.append(f"<section class='slide'><div class='section-heading'>{slide['title']}</div><ul class='body-text'>{bullets}</ul></section>")
+        elif slide["type"] == "interview":
+            slide_blocks.append(f"<section class='slide'><div class='section-heading'>{slide['title']}</div><p class='body-text'>{slide['body']}</p></section>")
+        elif slide["type"] == "experience":
+            items = "".join(
+                f"<div class='card'><div class='section-heading'>{item.get('title','')} @ {item.get('company','')}</div><div class='body-text'>{' | '.join(item.get('bullets', [])[:3])}</div></div>"
+                for item in slide.get("items", [])
+            )
+            slide_blocks.append(f"<section class='slide'><div class='section-heading'>{slide['title']}</div><div class='cards'>{items}</div></section>")
+        elif slide["type"] == "skills":
+            skills = slide.get("items", {})
+            groups = "".join(f"<div class='card'><div class='section-heading'>{k}</div><div class='body-text'>{', '.join(v)}</div></div>" for k, v in skills.items())
+            slide_blocks.append(f"<section class='slide'><div class='section-heading'>{slide['title']}</div><div class='cards'>{groups}</div></section>")
+        elif slide["type"] == "contact":
+            contact = slide.get("contact", {})
+            availability = slide.get("availability", "")
+            details = "".join(f"<div class='body-text'><strong>{k.title()}</strong>: {v}</div>" for k, v in contact.items())
+            slide_blocks.append(f"<section class='slide'><div class='section-heading'>{slide['title']}</div>{details}<div class='body-text'>Availability: {availability}</div></section>")
+    external_font_links = "" if not allow_external_fonts else ""  # reserved
+    html = f"""<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width, initial-scale=1'/>
+<title>Slide Deck</title>
+{external_font_links}
+<style>
+{css}
+</style>
+</head>
+<body>
+<main class='main'>
+{''.join(slide_blocks)}
+</main>
+</body>
+</html>
+"""
+    return html
+
+
+def post_write_verify(output_dir: str, allow_external_fonts: bool, expected_count: int, interview_pass: bool) -> None:
     files = ["index.html", "package.json", "vercel.json", "deck_metadata.json"]
-    for name in files:
-        path = os.path.join(output_dir, name)
-        if not (os.path.exists(path) and os.path.getsize(path) > 0):
-            raise RuntimeError(f"Missing expected file {name}")
+    for f in files:
+        path = os.path.join(output_dir, f)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            raise SystemExit(f"Missing or empty output file: {f}")
     with open(os.path.join(output_dir, "package.json"), "r", encoding="utf-8") as f:
         json.load(f)
     with open(os.path.join(output_dir, "vercel.json"), "r", encoding="utf-8") as f:
         json.load(f)
     with open(os.path.join(output_dir, "deck_metadata.json"), "r", encoding="utf-8") as f:
-        json.load(f)
-    html = open(os.path.join(output_dir, "index.html"), "r", encoding="utf-8").read()
+        metadata = json.load(f)
+    with open(os.path.join(output_dir, "index.html"), "r", encoding="utf-8") as f:
+        html = f.read()
     if html.count(":root") != 1:
-        raise RuntimeError(":root token block invalid")
-    if "var(--" not in html:
-        raise RuntimeError("Design tokens not used in HTML")
+        raise SystemExit("HTML must contain exactly one :root block")
+    if not allow_external_fonts and re.search(r"<link[^>]+href=\"https?://", html):
+        raise SystemExit("External dependencies are not allowed without --enable-google-fonts")
+    slide_count = html.count("class='slide'")
+    if slide_count < 5 or slide_count > 8:
+        raise SystemExit("Slide count must be between 5 and 8")
+    if not interview_pass:
+        raise SystemExit("Interview slide failed humanization checks")
 
 
-def write_outputs(output_dir: str, company: str, position: str, template: str, tokens: Dict[str, str], slides: List[Dict[str, str]], metadata: Dict[str, object]) -> None:
-    os.makedirs(output_dir, exist_ok=True)
-    css = generate_css(tokens, template)
-    css_errors = lint_css_for_tokens(css)
-    if css_errors:
-        raise RuntimeError("; ".join(css_errors))
-    html = build_html(company, position, template, css, slides)
-    pkg = {
-        "name": f"deck-{company.lower().replace(' ', '-')}",
-        "version": "1.0.0",
-        "scripts": {"start": "npx serve .", "dev": "npx serve ."},
+def reserve_seed(memory_dir: str, seed: str, company: str, position: str) -> None:
+    path = os.path.join(memory_dir, "vercel_deployments.json")
+    with FileLock(path + ".lock"):
+        data = load_json_file(path, [])
+        if isinstance(data, dict):
+            records = data.get("history", []) if isinstance(data.get("history"), list) else []
+        else:
+            records = data if isinstance(data, list) else []
+        if any(r.get("seed") == seed for r in records):
+            raise SystemExit(f"Seed {seed} already used")
+        record = {
+            "seed": seed,
+            "company": company,
+            "position": position,
+            "reserved_at": utcnow(),
+            "status": "reserved",
+        }
+        records.append(record)
+        if isinstance(data, dict):
+            data["history"] = records
+        else:
+            data = records
+        atomic_write_json(path, data)
+
+
+def mark_success(memory_dir: str, seed: str, company: str, position: str, design_tokens: Dict[str, str], params: Dict[str, str], layout: str, geometry: str, typography: str, deployment_url: Optional[str]) -> None:
+    path = os.path.join(memory_dir, "designs_that_deployed.json")
+    record = {
+        "seed": seed,
+        "company": company,
+        "position": position,
+        "design_tokens": design_tokens,
+        "design_parameters": params,
+        "layout_approach": layout,
+        "geometry": geometry,
+        "typography": typography,
+        "generated_at": utcnow(),
+        "memory_state_id": str(uuid.uuid4()),
+        "deployment_url": deployment_url,
     }
-    vercel = {"rewrites": [{"source": "/(.*)", "destination": "/index.html"}]}
-    atomic_write(os.path.join(output_dir, "index.html"), html)
-    atomic_write(os.path.join(output_dir, "package.json"), json.dumps(pkg, ensure_ascii=False, indent=2, sort_keys=True))
-    atomic_write(os.path.join(output_dir, "vercel.json"), json.dumps(vercel, ensure_ascii=False, indent=2, sort_keys=True))
-    atomic_write(os.path.join(output_dir, "deck_metadata.json"), json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True))
-    post_write_verify(output_dir)
+    with FileLock(path + ".lock"):
+        data = load_json_file(path, [])
+        if isinstance(data, dict):
+            history = data.get("history", []) if isinstance(data.get("history"), list) else []
+            history.append(record)
+            data["history"] = history
+        else:
+            data = (data if isinstance(data, list) else []) + [record]
+        atomic_write_json(path, data)
 
 
-def update_tone_memory(memory_dir: str, company: str, tone: str) -> None:
-    os.makedirs(memory_dir, exist_ok=True)
+def append_patterns_to_avoid(memory_dir: str, seed: str, reason: str) -> None:
+    path = os.path.join(memory_dir, "patterns_to_avoid.json")
+    entry = {"seed": seed, "reason": reason, "recorded_at": utcnow()}
+    with FileLock(path + ".lock"):
+        data = load_json_file(path, [])
+        if isinstance(data, dict):
+            history = data.get("history", []) if isinstance(data.get("history"), list) else []
+            history.append(entry)
+            data["history"] = history
+        else:
+            data = (data if isinstance(data, list) else []) + [entry]
+        atomic_write_json(path, data)
+
+
+def update_tone(memory_dir: str, tone: str) -> None:
     path = os.path.join(memory_dir, "user_tone_selections.json")
-    data = load_json(path, {})
-    data[company] = tone
-    payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
-    with with_lock(memory_dir):
-        atomic_write(path, payload)
+    entry = {"tone": tone, "updated_at": utcnow()}
+    with FileLock(path + ".lock"):
+        data = load_json_file(path, [])
+        if isinstance(data, dict):
+            history = data.get("history", []) if isinstance(data.get("history"), list) else []
+            history.append(entry)
+            data["history"] = history
+        else:
+            data = (data if isinstance(data, list) else []) + [entry]
+        atomic_write_json(path, data)
 
 
-def generate_metadata(seed: str, company: str, position: str, template: str, tone: str, palette: Dict[str, str], tokens: Dict[str, str], uniqueness_status: str) -> Dict[str, object]:
+def build_metadata(seed: str, company: str, position: str, palette: Dict[str, str], tokens: Dict[str, str], params: Dict[str, str], adjustments: List[str], uniqueness: str) -> Dict[str, object]:
     return {
         "seed": seed,
         "company": company,
         "position": position,
-        "template": template,
-        "tone": tone,
         "palette": palette,
         "design_tokens": tokens,
-        "layout_approach": template,
-        "geometry": tokens["--radius-md"],
-        "typography": tokens["--font-display"],
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "design_parameters": params,
+        "layout_approach": params.get("layout"),
+        "geometry": params.get("geometry"),
+        "typography": params.get("typography"),
+        "generated_at": utcnow(),
         "pipeline_version": PIPELINE_VERSION,
         "memory_state_id": str(uuid.uuid4()),
-        "accessibility_adjustments": {},
-        "uniqueness_status": uniqueness_status,
+        "accessibility_adjustments": adjustments,
+        "uniqueness_status": uniqueness,
+        "code_citations": {"source": "seed|spec"},
     }
 
 
-def uniqueness_signature(template: str, tokens: Dict[str, str]) -> Dict[str, str]:
-    return {
-        "layout": template,
-        "typography": tokens.get("--font-display", ""),
-        "geometry": tokens.get("--radius-md", ""),
-        "spacing": tokens.get("--space-md", ""),
-        "hierarchy": tokens.get("--text-3xl", ""),
-        "motion": tokens.get("--animation-enabled", ""),
-        "density": tokens.get("--space-unit", ""),
-    }
-
-
-def enforce_uniqueness(base_seed: str, company: str, position: str, date: str, template: str, palette: Dict[str, str], tokens: Dict[str, str], adjustments: Dict[str, str], memory_dir: str, max_prior: int) -> Tuple[str, random.Random, Dict[str, str], Dict[str, str], str]:
-    """Run uniqueness gate; may retry once with salted seed."""
-
-    prior_meta = load_json(os.path.join(memory_dir, "designs_that_deployed.json"), [])
-    prior_meta = prior_meta[:max_prior]
-    signature = uniqueness_signature(template, tokens)
-    if uniqueness_ok(signature, prior_meta):
-        return base_seed, build_rng(base_seed), tokens, adjustments, "passed"
-
-    retry_seed = derive_seed(company, position, date, "|retry1")
-    retry_rng = build_rng(retry_seed)
-    retry_tokens, retry_adjustments = design_tokens(palette, retry_rng, template)
-    if uniqueness_ok(uniqueness_signature(template, retry_tokens), prior_meta):
-        return retry_seed, retry_rng, retry_tokens, retry_adjustments, "passed_after_retry"
-
-    rejected_path = os.path.join(memory_dir, "patterns_to_avoid.json")
-    data = load_json(rejected_path, [])
-    data.append({"seed": retry_seed, "company": company, "position": position, "template": template})
-    os.makedirs(memory_dir, exist_ok=True)
-    with with_lock(memory_dir):
-        atomic_write(rejected_path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
-    raise SystemExit("Uniqueness check failed")
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate deterministic slide decks")
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Generate zero-trust slide deck (plan-first)")
     parser.add_argument("--company", required=True)
     parser.add_argument("--position", required=True)
     parser.add_argument("--palette-file", required=True)
     parser.add_argument("--content-file", required=True)
-    parser.add_argument("--template", choices=["modular", "asymmetric", "minimal", "bold"], required=True)
+    parser.add_argument("--template", choices=["modular", "asymmetric", "minimal", "bold"], default="minimal")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--date", default=time.strftime("%Y-%m-%d", time.gmtime()))
-    parser.add_argument("--tone", choices=["A_growth", "B_technical", "C_direct"])
+    parser.add_argument("--date", default=dt.datetime.utcnow().strftime("%Y-%m-%d"))
+    parser.add_argument("--tone", choices=["A_growth", "B_technical", "C_direct"], default="C_direct")
     parser.add_argument("--memory-dir", default=DEFAULT_MEMORY_DIR)
     parser.add_argument("--uniqueness-check", action="store_true")
     parser.add_argument("--max-prior-decks", type=int, default=200)
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--mark-success", action="store_true")
+    parser.add_argument("--deployment-url")
+    parser.add_argument("--enable-google-fonts", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
-    level = logging.INFO
-    if args.verbose:
-        level = logging.DEBUG
-    if args.quiet:
-        level = logging.ERROR
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.ERROR if args.quiet else logging.INFO, format="%(levelname)s:%(message)s")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.memory_dir, exist_ok=True)
+    ensure_within(args.output_dir, [os.path.abspath(args.output_dir), os.path.abspath(args.memory_dir)])
 
     palette = parse_palette(args.palette_file)
-    tone = select_tone(args.company, args.tone, args.memory_dir)
+    content = parse_content(args.content_file)
+
     seed = derive_seed(args.company, args.position, args.date)
-    rng = build_rng(seed)
-    content = gather_content(args.content_file)
-    tokens, adjustments = design_tokens(palette, rng, args.template)
-    slides = build_slides(args.company, args.position, content, rng)
+    rng = random.Random(int(uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex[:12], 16))
+
+    params = design_parameters(rng)
+    tokens = build_tokens(palette, rng)
+    adjustments = adjust_for_accessibility(tokens)
+
+    interview_slide_text = build_interview_text(content)
+    interview_ok, interview_msg = humanization_check(interview_slide_text)
+
     uniqueness_status = "skipped"
-    if args.yes and args.uniqueness_check:
-        seed, rng, tokens, adjustments, uniqueness_status = enforce_uniqueness(
-            seed,
-            args.company,
-            args.position,
-            args.date,
-            args.template,
-            palette,
-            tokens,
-            adjustments,
-            args.memory_dir,
-            args.max_prior_decks,
-        )
-        slides = build_slides(args.company, args.position, content, rng)
-
-    plan = plan_summary(seed, args.template, tone, palette, args.output_dir, uniqueness_status)
-    print(plan)
-
+    if args.uniqueness_check:
+        ok, msg = ensure_uniqueness(seed, params, tokens, args.memory_dir, args.max_prior_decks)
+        uniqueness_status = msg
+        if not ok:
+            if not args.yes:
+                print(json.dumps(generate_plan(seed, params, tokens, f"FAIL: {msg}", ["index.html", "package.json", "vercel.json", "deck_metadata.json"]), ensure_ascii=False, indent=2, sort_keys=True))
+                return
+            else:
+                seed_retry = derive_seed(args.company, args.position, args.date, "|retry1")
+                rng = random.Random(int(uuid.uuid5(uuid.NAMESPACE_DNS, seed_retry).hex[:12], 16))
+                params = design_parameters(rng)
+                tokens = build_tokens(palette, rng)
+                adjustments = adjust_for_accessibility(tokens)
+                ok2, msg2 = ensure_uniqueness(seed_retry, params, tokens, args.memory_dir, args.max_prior_decks)
+                uniqueness_status = msg2
+                if not ok2:
+                    append_patterns_to_avoid(args.memory_dir, seed_retry, msg2)
+                    raise SystemExit(f"Uniqueness failed after retry: {msg2}")
+                seed = seed_retry
+    plan = generate_plan(seed, params, tokens, uniqueness_status, ["index.html", "package.json", "vercel.json", "deck_metadata.json"])
+    print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
     if not args.yes:
-        return 0
+        return
 
-    metadata = generate_metadata(seed, args.company, args.position, args.template, tone, palette, tokens, uniqueness_status)
-    metadata["accessibility_adjustments"] = adjustments
-    write_outputs(args.output_dir, args.company, args.position, args.template, tokens, slides, metadata)
-    update_tone_memory(args.memory_dir, args.company, tone)
-    return 0
+    reserve_seed(args.memory_dir, seed, args.company, args.position)
+
+    slides = build_slides(content)
+    interview_slide = next((s for s in slides if s.get("type") == "interview"), None)
+    if interview_slide:
+        interview_slide["body"] = interview_slide_text
+    if not interview_ok:
+        raise SystemExit(interview_msg)
+
+    html = render_html(slides, tokens, args.enable_google_fonts)
+
+    package_json = {
+        "name": "slide-deck",
+        "version": "1.0.0",
+        "scripts": {"start": "npx serve .", "dev": "npx serve ."},
+    }
+    vercel_json = {"rewrites": [{"source": "/(.*)", "destination": "/index.html"}]}
+    metadata = build_metadata(seed, args.company, args.position, palette, tokens, params, adjustments, uniqueness_status)
+
+    files_to_write = {
+        os.path.join(args.output_dir, "index.html"): html,
+        os.path.join(args.output_dir, "package.json"): json.dumps(package_json, ensure_ascii=False, indent=2, sort_keys=True),
+        os.path.join(args.output_dir, "vercel.json"): json.dumps(vercel_json, ensure_ascii=False, indent=2, sort_keys=True),
+        os.path.join(args.output_dir, "deck_metadata.json"): json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True),
+    }
+
+    for path, content_str in files_to_write.items():
+        ensure_within(path, [os.path.abspath(args.output_dir), os.path.abspath(args.memory_dir)])
+        atomic_write_text(path, content_str)
+
+    post_write_verify(args.output_dir, args.enable_google_fonts, len(slides), interview_ok)
+
+    if args.mark_success:
+        mark_success(args.memory_dir, seed, args.company, args.position, tokens, params, params.get("layout", ""), params.get("geometry", ""), params.get("typography", ""), args.deployment_url)
+    if args.deployment_url:
+        path = os.path.join(args.memory_dir, "vercel_deployments.json")
+        with FileLock(path + ".lock"):
+            data = load_json_file(path, [])
+            if isinstance(data, dict):
+                records = data.get("history", []) if isinstance(data.get("history"), list) else []
+            else:
+                records = data if isinstance(data, list) else []
+            records.append({"seed": seed, "deployment_url": args.deployment_url, "recorded_at": utcnow(), "status": "deployed"})
+            if isinstance(data, dict):
+                data["history"] = records
+            else:
+                data = records
+            atomic_write_json(path, data)
+    update_tone(args.memory_dir, args.tone)
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+if __name__ == "__main__":
+    main()
