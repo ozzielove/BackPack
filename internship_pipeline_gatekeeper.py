@@ -32,7 +32,7 @@ CLOSED_PHRASES = [
     "requisition is closed",
 ]
 AGGREGATORS = {"indeed.com", "ziprecruiter.com", "glassdoor.com", "linkedin.com", "monster.com"}
-ATS_HOSTS = {"greenhouse.io", "lever.co", "workday", "ashbyhq.com", "smartrecruiters.com", "icims.com"}
+ATS_HOSTS = {"greenhouse.io", "lever.co", "myworkdayjobs.com", "ashbyhq.com", "smartrecruiters.com", "icims.com"}
 REQUIRED_TRACKER_COLUMNS = [
     "App #",
     "Company",
@@ -60,8 +60,16 @@ VERIFICATION_BASE_COLUMNS = [
 ]
 
 
-def is_blocked_netloc(netloc: str) -> bool:
-    host = netloc.split("@")[-1].split(":")[0]
+def normalize_hostname(host: str) -> str:
+    host = (host or "").lower().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def is_blocked_host(host: str) -> bool:
+    if not host:
+        return False
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -84,21 +92,24 @@ def is_blocked_netloc(netloc: str) -> bool:
 def is_url_safe(url: str) -> bool:
     """>>> is_url_safe("http://127.0.0.1")
 False
->>> is_url_safe("https://example.com")
+>>> is_url_safe("https://93.184.216.34")
 True
 """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return False
-    host = parsed.hostname or ""
-    if is_blocked_netloc(host):
+    host = parsed.hostname
+    if not host:
+        return False
+    if is_blocked_host(host):
         return False
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
         return False
     for info in infos:
-        if is_blocked_netloc(info[4][0]):
+        resolved = info[4][0]
+        if is_blocked_host(resolved):
             return False
     return True
 
@@ -148,15 +159,14 @@ def is_within(path: str, root: str) -> bool:
 
 def safe_file_write(path: str, args) -> bool:
     real = os.path.realpath(path)
-    exclusions_ok = real == os.path.realpath(args.exclusions) and is_within(
-        real, os.path.join(os.path.realpath(args.pal_dir), "Job_Search_System")
-    )
-    verification_ok = real == os.path.realpath(args.verification) and is_within(
-        real, os.path.join(os.path.realpath(args.pal_dir), "Job_Search_System")
-    )
-    tracker_ok = real == os.path.realpath(args.tracker) and is_within(
-        real, os.path.realpath(args.pal_dir)
-    )
+    pal_root = os.path.realpath(args.pal_dir)
+    js_root = os.path.join(pal_root, "Job_Search_System")
+    exclusions_expected = os.path.realpath(os.path.join(js_root, "search_exclusions.csv"))
+    verification_expected = os.path.realpath(os.path.join(js_root, "internship_verification_list.csv"))
+    tracker_expected = os.path.realpath(os.path.join(pal_root, "job_application_tracker.csv"))
+    exclusions_ok = real == exclusions_expected and real == os.path.realpath(args.exclusions)
+    verification_ok = real == verification_expected and real == os.path.realpath(args.verification)
+    tracker_ok = real == tracker_expected and real == os.path.realpath(args.tracker)
     return exclusions_ok or verification_ok or tracker_ok
 
 
@@ -278,12 +288,21 @@ def fetch_url(url: str, timeout: int, max_bytes: int, user_agent: str) -> Tuple[
     raise ValueError("Too many redirects")
 
 
+def host_matches_ats(host: str) -> bool:
+    norm = normalize_hostname(host)
+    for candidate in ATS_HOSTS:
+        cand_norm = normalize_hostname(candidate)
+        if norm == cand_norm or norm.endswith("." + cand_norm):
+            return True
+    return False
+
+
 def detect_canonical_links(content: str, base_url: str) -> Optional[str]:
     links = re.findall(r"href\s*=\s*['\"]([^'\"]+)['\"]", content, flags=re.IGNORECASE)
     for link in links:
         resolved = urllib.parse.urljoin(base_url, link)
-        host = (urllib.parse.urlparse(resolved).hostname or "").lower()
-        if any(h in host for h in ATS_HOSTS):
+        host = urllib.parse.urlparse(resolved).hostname or ""
+        if host_matches_ats(host):
             return resolved
     return None
 
@@ -293,12 +312,12 @@ def classify_listing(status_code: int, content: str, final_url: str) -> Tuple[st
     if status_code in (404, 410) or ghost_closed_detect(lowered):
         return "EXCLUDE", "Position closed"
     parsed = urllib.parse.urlparse(final_url)
-    host = (parsed.hostname or "").lower() if parsed.hostname else ""
+    host = normalize_hostname(parsed.hostname or "") if parsed.hostname else ""
     canonical = detect_canonical_links(content, final_url)
-    if any(agg in host for agg in AGGREGATORS):
+    if any(host == normalize_hostname(agg) or host.endswith("." + normalize_hostname(agg)) for agg in AGGREGATORS):
         if not canonical:
             return "MONITOR", "Aggregator no ATS canonical"
-        host = urllib.parse.urlparse(canonical).hostname or host
+        host = normalize_hostname(urllib.parse.urlparse(canonical).hostname or host)
         return "APPLY", f"Aggregator routed to ATS {host}"
     freshness = re.search(r"posted[^\d]*(\d+)\s+day", lowered)
     if freshness and int(freshness.group(1)) > 14:
@@ -324,6 +343,9 @@ def ensure_directory(path: str) -> None:
 
 
 def ingest(args) -> int:
+    if not os.path.isdir(args.need_to_apply):
+        sys.stderr.write(f"Need_To_Apply directory not found: {args.need_to_apply}\n")
+        return 2
     rows, header, missing = load_or_init_csv(
         args.verification, VERIFICATION_BASE_COLUMNS, args, write_allowed=args.yes
     )
@@ -398,35 +420,29 @@ def verify(args) -> int:
             continue
         if row.get("URL", ""):
             updates.append(row)
+    if not args.yes:
+        print(f"PLAN verify: would evaluate {len(updates)} rows; 0 status changes")
+        if missing:
+            print(f"Verification file missing; would create {args.verification}")
+        for url in [r.get("URL", "") for r in updates][:10]:
+            print(f"Would fetch: {url}")
+        print("PLAN: no network in plan mode; cannot classify. Use --yes to verify.")
+        return 0
     changes = []
-    plan_fetch = []
     for row in updates:
-        plan_fetch.append(row.get("URL", ""))
         new_row = dict(row)
         status = row.get("Status", "")
         reason = row.get("Reason", "")
-        action_reason = "Plan-only"
-        new_status = status
-        if args.yes:
-            try:
-                code, content, final_url = fetch_url(row.get("URL", ""), args.timeout, args.max_bytes, args.user_agent)
-                new_status, action_reason = classify_listing(code, content.decode("utf-8", errors="ignore"), final_url)
-            except Exception as e:
-                new_status, action_reason = "MONITOR", f"fetch error: {e}"
+        try:
+            code, content, final_url = fetch_url(row.get("URL", ""), args.timeout, args.max_bytes, args.user_agent)
+            new_status, action_reason = classify_listing(code, content.decode("utf-8", errors="ignore"), final_url)
+        except Exception as e:
+            new_status, action_reason = "MONITOR", f"fetch error: {e}"
         new_row["Status"] = new_status
         new_row["Reason"] = action_reason
         if (new_status != status) or (action_reason != reason):
             changes.append((row, new_row))
             row.update(new_row)
-    if not args.yes:
-        print(f"PLAN verify: would evaluate {len(updates)} rows; {len(changes)} status changes")
-        if missing:
-            print(f"Verification file missing; would create {args.verification}")
-        for url in plan_fetch[:10]:
-            print(f"Would fetch: {url}")
-        for line in diff_preview(changes):
-            print(line)
-        return 0
     write_csv_atomic(args.verification, rows, header, args)
     print(f"Applied verify: updated {len(changes)} rows")
     for line in diff_preview(changes):
@@ -460,6 +476,9 @@ def triage(args) -> int:
     for row in rows:
         folder = row.get("Folder Path", "")
         if not folder:
+            continue
+        if not os.path.exists(folder):
+            logging.warning("Folder missing, skipping triage: %s", folder)
             continue
         status = row.get("Status", "")
         if not is_application_folder(folder, allowed_roots + [os.path.realpath(args.pal_dir)]):
