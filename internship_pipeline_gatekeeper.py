@@ -572,15 +572,26 @@ def load_job_description(company_folder: str) -> Dict[str, str]:
 
 
 def mark_applied(args) -> int:
+    company_folder = os.path.join(args.need_to_apply, f"{args.company}_Application")
+    dest_folder = os.path.join(args.pal_dir, f"{args.company}_Application")
+    if not os.path.exists(company_folder):
+        sys.stderr.write("Application folder missing; cannot mark applied\n")
+        return 2
+    if os.path.exists(dest_folder):
+        sys.stderr.write("Destination already exists; aborting to avoid overwrite\n")
+        return 2
+    src_ok = is_application_folder(company_folder, [os.path.realpath(args.need_to_apply)])
+    dst_ok = is_application_folder(dest_folder, [os.path.realpath(args.pal_dir)])
+    if not (src_ok and dst_ok):
+        sys.stderr.write("Unsafe source or destination path\n")
+        return 1
+    jd = load_job_description(company_folder)
     tracker_rows, tracker_header, tracker_missing = load_or_init_csv(
         args.tracker, REQUIRED_TRACKER_COLUMNS, args, write_allowed=args.yes
     )
     exclusions_rows, exclusions_header, exclusions_missing = load_or_init_csv(
         args.exclusions, ["Company", "Reason", "Date Added", "Source"], args, write_allowed=args.yes
     )
-    company_folder = os.path.join(args.need_to_apply, f"{args.company}_Application")
-    dest_folder = os.path.join(args.pal_dir, f"{args.company}_Application")
-    jd = load_job_description(company_folder)
     position = jd.get("position") or jd.get("title") or ""
     application_url = extract_url_from_json(jd) if jd else ""
     date_applied = args.date or dt.date.today().isoformat()
@@ -603,12 +614,6 @@ def mark_applied(args) -> int:
         "Date Added": date_applied,
         "Source": "application_submitted",
     }
-    if not os.path.exists(company_folder):
-        print("Application folder missing; cannot mark applied")
-        return 2
-    if os.path.exists(dest_folder):
-        print("Destination already exists; aborting to avoid overwrite")
-        return 3
     if not args.yes:
         print("PLAN mark-applied:")
         if tracker_missing:
@@ -619,12 +624,11 @@ def mark_applied(args) -> int:
         print(f"Append exclusion: {new_exclusion_row}")
         print(f"Append tracker row: {new_tracker_row}")
         return 0
-    if not safe_folder_action(company_folder, args, allow_pal_root=True) or not is_application_folder(
-        dest_folder, [os.path.realpath(args.pal_dir)]
-    ):
-        print("Unsafe path")
+    try:
+        shutil.move(company_folder, dest_folder)
+    except Exception as exc:
+        sys.stderr.write(f"Failed to move folder: {exc}\n")
         return 1
-    shutil.move(company_folder, dest_folder)
     exclusions_rows.append(new_exclusion_row)
     write_csv_atomic(args.exclusions, exclusions_rows, exclusions_header, args)
     tracker_rows.append(new_tracker_row)
