@@ -1,0 +1,155 @@
+{
+  "config_performance_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ConfigPerformance",
+    "description": "Schema for aggregated performance metrics for each resume/cover configuration.",
+    "type": "object",
+    "patternProperties": {
+      "^.*$": {
+        "type": "object",
+        "required": [
+          "recruiter_screen_rate",
+          "funnel_depth",
+          "average_rejection_speed",
+          "num_applications",
+          "is_baseline"
+        ],
+        "properties": {
+          "recruiter_screen_rate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Weighted proportion of applications for this configuration that progressed to at least the recruiter screen stage."
+          },
+          "funnel_depth": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 4,
+            "description": "Weighted average of funnel stage scores (0=auto reject, 1=recruiter screen, 2=hiring manager, 3=final round, 4=offer)."
+          },
+          "average_rejection_speed": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Weighted average number of days to a rejection decision or last update for this configuration."
+          },
+          "num_applications": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total number of applications tracked for this configuration."
+          },
+          "is_baseline": {
+            "type": "boolean",
+            "description": "Indicates whether this configuration meets or exceeds the system median recruiter screen rate and is therefore treated as a baseline."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "additionalProperties": false
+  },
+  "cluster_yield_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ClusterYield",
+    "description": "Schema for aggregated yield metrics by role cluster.",
+    "type": "object",
+    "patternProperties": {
+      "^.*$": {
+        "type": "object",
+        "required": [
+          "recruiter_screen_rate",
+          "funnel_depth",
+          "cluster_yield",
+          "num_applications"
+        ],
+        "properties": {
+          "recruiter_screen_rate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Weighted proportion of applications in this cluster that reached at least the recruiter screen stage."
+          },
+          "funnel_depth": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 4,
+            "description": "Weighted average of funnel stage scores across the cluster."
+          },
+          "cluster_yield": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Composite yield score computed as 0.6 × recruiter_screen_rate + 0.4 × normalized funnel depth."
+          },
+          "num_applications": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total number of applications tracked for this cluster."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "additionalProperties": false
+  },
+  "ats_outcome_patterns_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ATSOutcomePatterns",
+    "description": "Schema for aggregated failure mode frequencies per ATS system.",
+    "type": "object",
+    "patternProperties": {
+      "^.*$": {
+        "type": "object",
+        "properties": {
+          "ELIGIBILITY_GATE": {"type": "number", "minimum": 0, "maximum": 1},
+          "ATS_PACKAGING": {"type": "number", "minimum": 0, "maximum": 1},
+          "DOMAIN_MISMATCH": {"type": "number", "minimum": 0, "maximum": 1},
+          "TOOLING_GAP": {"type": "number", "minimum": 0, "maximum": 1},
+          "SENIORITY_MISMATCH": {"type": "number", "minimum": 0, "maximum": 1},
+          "WEAK_EVIDENCE": {"type": "number", "minimum": 0, "maximum": 1},
+          "EXTERNAL_NOISE": {"type": "number", "minimum": 0, "maximum": 1},
+          "UNKNOWN": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "additionalProperties": false
+  },
+  "market_performance_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "MarketPerformance",
+    "description": "Schema for overall market performance metrics across all applications.",
+    "type": "object",
+    "required": [
+      "overall_recruiter_screen_rate",
+      "overall_funnel_depth",
+      "overall_cluster_yield",
+      "last_updated"
+    ],
+    "properties": {
+      "overall_recruiter_screen_rate": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Weighted proportion of all applications that reached at least the recruiter screen stage across all clusters and configurations."
+      },
+      "overall_funnel_depth": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 4,
+        "description": "Weighted average of funnel stage scores across all applications."
+      },
+      "overall_cluster_yield": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Composite yield score across all clusters computed as 0.6 × overall recruiter screen rate + 0.4 × normalized overall funnel depth."
+      },
+      "last_updated": {
+        "type": "string",
+        "format": "date",
+        "description": "Date in ISO format (YYYY-MM-DD) when the market performance metrics were last updated."
+      }
+    },
+    "additionalProperties": false
+  }
+}
