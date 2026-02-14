@@ -8,7 +8,7 @@ Architecture
 1) `PDFCompiler` (engine)
    - Incremental page extraction with `pdfplumber`.
    - OCR fallback only for low-density pages.
-   - Bank-profile detection + bank-specific parsing overlays.
+   - Optional bank-specific semantic parsing overlays.
 
 2) Worker pipeline
    - File-level multiprocessing via `ProcessPoolExecutor`.
@@ -16,26 +16,28 @@ Architecture
 
 3) CLI
    - Batch compilation from input directory to output directory.
+   - Optional lockstep mode for sequential processing.
 
 Performance notes
 -----------------
 - Pages are processed incrementally to avoid whole-document buffering.
 - OCR rasterization is one-page-at-a-time.
-- Multiprocessing parallelizes independent PDFs.
+- Multiprocessing parallelizes independent PDFs when enabled.
 
 Customization
 -------------
-This module includes custom extractors for:
+This module includes custom semantic parsers for:
 - Navy Federal statements
 - TD Bank statements
 
-The bank-specific extraction emits normalized metadata and transaction rows that
-are convenient for recurring-bill detectors and downstream parser agents.
+Semantic parsing is optional (`--emit-transactions`) so this module can operate as a
+pure compiler IR backend when desired.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -43,11 +45,14 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-import pdfplumber
+try:
+    import pdfplumber
+except Exception:  # pragma: no cover
+    pdfplumber = None
 
 try:
     from pdf2image import convert_from_path
@@ -66,9 +71,9 @@ ISO_TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 class TransactionRecord:
     """Normalized transaction row for downstream recurring-bill analysis."""
 
-    posting_date: str | None
+    posting_date: str | None  # ISO date YYYY-MM-DD
     description: str
-    amount: float | None
+    amount: float | None  # normalized: money out negative, money in positive
     balance: float | None
     category: str | None
     source_bank: str
@@ -81,7 +86,8 @@ class BankProfile:
     bank_name: str
     statement_period: str | None
     account_holder: str | None
-    account_number_masked: str | None
+    account_last4: str | None
+    account_hash: str | None
     routing_number: str | None
     access_reference: str | None
 
@@ -111,7 +117,7 @@ class DocumentIR:
     extraction_started_at: str
     extraction_completed_at: str
     metrics: DocumentMetrics
-    bank_profile: BankProfile
+    bank_profile: BankProfile | None
     transactions: list[TransactionRecord]
 
 
@@ -132,8 +138,14 @@ CustomTableExtractor = Callable[[Any], list[list[list[str | None]]]]
 CustomPageProcessor = Callable[[PageIR], PageIR]
 
 
+@dataclass(slots=True)
+class StatementPeriod:
+    start: date
+    end: date
+
+
 class PDFCompiler:
-    """Compiles a single PDF into deterministic JSON IR with bank customizations."""
+    """Compiles a single PDF into deterministic JSON IR with optional semantic parsing."""
 
     NAVY_MARKERS = ("navy federal", "statement of account", "access no")
     TD_MARKERS = ("td bank", "statement of account", "cust ref #", "primary account #")
@@ -144,11 +156,13 @@ class PDFCompiler:
         ocr_dpi: int = 300,
         custom_table_extractor: CustomTableExtractor | None = None,
         custom_page_processor: CustomPageProcessor | None = None,
+        emit_transactions: bool = True,
     ) -> None:
         self.text_density_threshold = text_density_threshold
         self.ocr_dpi = ocr_dpi
         self.custom_table_extractor = custom_table_extractor
         self.custom_page_processor = custom_page_processor
+        self.emit_transactions = emit_transactions
 
     def extract_pdf(self, pdf_path: Path) -> DocumentIR | ErrorReport:
         start = _utc_now()
@@ -158,55 +172,68 @@ class PDFCompiler:
         ocr_pages = 0
         native_pages = 0
 
+        if pdfplumber is None:
+            return ErrorReport(
+                source_pdf=str(pdf_path),
+                status="error",
+                extraction_started_at=start,
+                extraction_completed_at=_utc_now(),
+                duration_seconds=0.0,
+                error_type="MissingDependency",
+                error_message="pdfplumber is not installed.",
+                traceback="",
+                extraction_notes=["Install pdfplumber to run extraction."],
+            )
+
         try:
             with pdfplumber.open(str(pdf_path)) as pdf:
                 page_count = len(pdf.pages)
-                full_text_parts: list[str] = []
+                combined_page_text: list[str] = []
 
-                for index, page in enumerate(pdf.pages, start=1):
+                for idx, page in enumerate(pdf.pages, start=1):
                     page_text = page.extract_text() or ""
                     tables = self._extract_tables(page)
 
                     ocr_text: str | None = None
                     if self._needs_ocr(page_text, tables):
-                        ocr_text = self._ocr_page(pdf_path, index)
+                        ocr_text, ocr_note = self._ocr_page(pdf_path, idx)
+                        if ocr_note:
+                            notes.append(f"Page {idx}: {ocr_note}")
                         if ocr_text:
-                            notes.append(f"Page {index}: OCR fallback used due to low text density.")
                             ocr_pages += 1
-                        else:
-                            notes.append(f"Page {index}: OCR fallback attempted but yielded no text.")
                     else:
                         native_pages += 1
 
-                    combined_text = f"{page_text}\n{ocr_text or ''}".strip()
-                    full_text_parts.append(combined_text)
+                    combined_page_text.append(f"{page_text}\n{ocr_text or ''}".strip())
 
                     page_ir = PageIR(
-                        page_number=index,
+                        page_number=idx,
                         text=page_text,
                         tables=tables,
                         ocr_text=ocr_text,
                         extraction_confidence=self._confidence_score(page_text, ocr_text, tables),
                     )
-
                     if self.custom_page_processor is not None:
                         page_ir = self.custom_page_processor(page_ir)
-
                     pages_ir.append(page_ir)
 
-            full_text = "\n".join(full_text_parts)
-            bank_profile, transactions, bank_notes = self._bank_specific_extract(full_text)
-            notes.extend(bank_notes)
+            bank_profile: BankProfile | None = None
+            transactions: list[TransactionRecord] = []
+            if self.emit_transactions:
+                full_text = "\n".join(combined_page_text)
+                bank_profile, transactions, bank_notes = self._bank_specific_extract(full_text, pages_ir)
+                notes.extend(bank_notes)
+            else:
+                notes.append("Semantic bank parsing disabled (--emit-transactions not set).")
 
             duration = time.perf_counter() - t0
-            end = _utc_now()
             return DocumentIR(
                 source_pdf=str(pdf_path),
-                page_count=len(pages_ir),
+                page_count=page_count,
                 pages=pages_ir,
                 extraction_notes=notes,
                 extraction_started_at=start,
-                extraction_completed_at=end,
+                extraction_completed_at=_utc_now(),
                 metrics=DocumentMetrics(
                     duration_seconds=round(duration, 4),
                     ocr_pages=ocr_pages,
@@ -215,15 +242,13 @@ class PDFCompiler:
                 bank_profile=bank_profile,
                 transactions=transactions,
             )
-
         except Exception as exc:
-            end = _utc_now()
             duration = time.perf_counter() - t0
             return ErrorReport(
                 source_pdf=str(pdf_path),
                 status="error",
                 extraction_started_at=start,
-                extraction_completed_at=end,
+                extraction_completed_at=_utc_now(),
                 duration_seconds=round(duration, 4),
                 error_type=type(exc).__name__,
                 error_message=str(exc),
@@ -238,14 +263,23 @@ class PDFCompiler:
         return [[[cell if cell is not None else None for cell in row] for row in table] for table in rows]
 
     def _needs_ocr(self, text: str, tables: list[list[list[str | None]]]) -> bool:
-        if len(text.strip()) >= self.text_density_threshold:
+        text_len = len(text.strip())
+        if text_len >= self.text_density_threshold:
             return False
-        table_cells = sum(len(row) for table in tables for row in table)
-        return table_cells == 0
 
-    def _ocr_page(self, pdf_path: Path, page_number: int) -> str | None:
+        table_cells = sum(len(row) for table in tables for row in table)
+        if table_cells > 0:
+            return False
+
+        # Avoid unnecessary OCR when page already shows likely transaction patterns.
+        if re.search(r"\b\d{2}[/-]\d{2}(?:[/-]\d{2,4})?\b", text):
+            return False
+
+        return True
+
+    def _ocr_page(self, pdf_path: Path, page_number: int) -> tuple[str | None, str | None]:
         if convert_from_path is None or pytesseract is None:
-            return None
+            return None, "OCR unavailable (missing pdf2image/pytesseract)."
         try:
             images = convert_from_path(
                 pdf_path=str(pdf_path),
@@ -255,11 +289,13 @@ class PDFCompiler:
                 thread_count=1,
             )
             if not images:
-                return None
-            text = pytesseract.image_to_string(images[0])
-            return text.strip() or None
-        except Exception:
-            return None
+                return None, "OCR rasterization produced no images."
+            text = pytesseract.image_to_string(images[0]).strip()
+            if not text:
+                return None, "OCR ran but returned empty text."
+            return text, "OCR fallback used due to low text density."
+        except Exception as exc:
+            return None, f"OCR failed ({type(exc).__name__}): {exc}"
 
     @staticmethod
     def _confidence_score(text: str, ocr_text: str | None, tables: list[list[list[str | None]]]) -> float:
@@ -279,33 +315,42 @@ class PDFCompiler:
             base = 0.2
         return round(min(1.0, base + table_bonus), 3)
 
-    def _bank_specific_extract(self, full_text: str) -> tuple[BankProfile, list[TransactionRecord], list[str]]:
-        lowered = full_text.lower()
-        if all(marker in lowered for marker in self.NAVY_MARKERS):
-            profile, txns, notes = self._extract_navy_federal(full_text)
+    def _bank_specific_extract(
+        self, full_text: str, pages_ir: list[PageIR]
+    ) -> tuple[BankProfile | None, list[TransactionRecord], list[str]]:
+        navy_score = self._bank_score(full_text, self.NAVY_MARKERS)
+        td_score = self._bank_score(full_text, self.TD_MARKERS)
+
+        notes: list[str] = [f"Bank marker scores -> NAVY_FEDERAL={navy_score}, TD_BANK={td_score}"]
+
+        if navy_score >= 2 and navy_score >= td_score:
+            profile, txns, subnotes = self._extract_navy_federal(full_text, pages_ir)
+            notes.extend(subnotes)
             notes.append("Detected bank profile: Navy Federal Credit Union.")
             return profile, txns, notes
-        if all(marker in lowered for marker in self.TD_MARKERS):
-            profile, txns, notes = self._extract_td_bank(full_text)
+        if td_score >= 2 and td_score > navy_score:
+            profile, txns, subnotes = self._extract_td_bank(full_text, pages_ir)
+            notes.extend(subnotes)
             notes.append("Detected bank profile: TD Bank.")
             return profile, txns, notes
 
-        profile = BankProfile(
-            bank_name="UNKNOWN",
-            statement_period=self._regex_group(full_text, r"Statement\s+Period[:\s]+([^\n]+)"),
-            account_holder=None,
-            account_number_masked=self._regex_group(full_text, r"Account\s*(?:#|No\.?|Number)\s*[:\-]?\s*([\d\-*]+)"),
-            routing_number=self._regex_group(full_text, r"Routing\s+Number\s*[:\-]?\s*([\d\-]+)"),
-            access_reference=self._regex_group(full_text, r"Access\s+No\.?\s*[:\-]?\s*([A-Za-z0-9\-]+)"),
-        )
-        return profile, [], ["Bank-specific parser not matched; returned generic metadata only."]
+        notes.append("Bank-specific parser not matched; metadata unavailable.")
+        return None, [], notes
 
-    def _extract_navy_federal(self, full_text: str) -> tuple[BankProfile, list[TransactionRecord], list[str]]:
+    @staticmethod
+    def _bank_score(text: str, markers: tuple[str, ...]) -> int:
+        lowered = text.lower()
+        return sum(1 for marker in markers if marker in lowered)
+
+    def _extract_navy_federal(
+        self, full_text: str, pages_ir: list[PageIR]
+    ) -> tuple[BankProfile, list[TransactionRecord], list[str]]:
         notes: list[str] = []
-        period = self._regex_group(full_text, r"Statement\s+Period\s*\n?\s*([0-9/\-\s]+)")
+        period_raw = self._regex_group(full_text, r"Statement\s+Period\s*\n?\s*([0-9/\-\s]+)")
+        period = _parse_statement_period(period_raw)
         access_no = self._regex_group(full_text, r"Access\s+No\.?\s*([A-Za-z0-9\-]+)")
         routing = self._regex_group(full_text, r"Routing\s+Number\s*[:\-]?\s*([\d\-]+)")
-        acct = self._regex_group(full_text, r"EveryDay\s+Checking\s*-\s*([0-9]+)")
+        account_raw = self._regex_group(full_text, r"EveryDay\s+Checking\s*-\s*([0-9]+)")
 
         holder = None
         holder_match = re.search(r"For\s+([A-Z][A-Z\s\.-]+)", full_text)
@@ -314,21 +359,28 @@ class PDFCompiler:
 
         profile = BankProfile(
             bank_name="NAVY_FEDERAL",
-            statement_period=period,
+            statement_period=period_raw,
             account_holder=holder,
-            account_number_masked=acct,
+            account_last4=_mask_last4(account_raw),
+            account_hash=_hash_identifier(account_raw),
             routing_number=routing,
             access_reference=access_no,
         )
 
-        txns = self._parse_navy_transactions(full_text)
+        txns = self._parse_navy_transactions_from_tables(pages_ir, period)
+        if not txns:
+            txns = self._parse_navy_transactions_from_text(full_text, period)
+            notes.append("Navy Federal parser used text fallback (tables not usable).")
         notes.append(f"Navy Federal transaction rows parsed: {len(txns)}")
         return profile, txns, notes
 
-    def _extract_td_bank(self, full_text: str) -> tuple[BankProfile, list[TransactionRecord], list[str]]:
+    def _extract_td_bank(
+        self, full_text: str, pages_ir: list[PageIR]
+    ) -> tuple[BankProfile, list[TransactionRecord], list[str]]:
         notes: list[str] = []
-        period = self._regex_group(full_text, r"Statement\s+Period\s*:\s*([^\n]+)")
-        account = self._regex_group(full_text, r"Primary\s+Account\s*#\s*:\s*([\d\-]+)")
+        period_raw = self._regex_group(full_text, r"Statement\s+Period\s*:\s*([^\n]+)")
+        period = _parse_statement_period(period_raw)
+        account_raw = self._regex_group(full_text, r"Primary\s+Account\s*#\s*:\s*([\d\-]+)")
         cust_ref = self._regex_group(full_text, r"Cust\s+Ref\s*#\s*:\s*([^\n]+)")
 
         holder = None
@@ -340,94 +392,180 @@ class PDFCompiler:
 
         profile = BankProfile(
             bank_name="TD_BANK",
-            statement_period=period,
+            statement_period=period_raw,
             account_holder=holder,
-            account_number_masked=account,
+            account_last4=_mask_last4(account_raw),
+            account_hash=_hash_identifier(account_raw),
             routing_number=None,
             access_reference=cust_ref,
         )
 
-        txns = self._parse_td_transactions(full_text)
+        txns = self._parse_td_transactions_from_tables(pages_ir, period)
+        if not txns:
+            txns = self._parse_td_transactions_from_text(full_text, period)
+            notes.append("TD parser used text fallback (tables not usable).")
         notes.append(f"TD Bank transaction rows parsed: {len(txns)}")
         return profile, txns, notes
 
-    def _parse_navy_transactions(self, full_text: str) -> list[TransactionRecord]:
+    def _parse_navy_transactions_from_tables(
+        self, pages_ir: list[PageIR], period: StatementPeriod | None
+    ) -> list[TransactionRecord]:
         txns: list[TransactionRecord] = []
-        # Example pattern: 04-22 POS Debit- ... CA ... 29.95 26.10
+        date_re = re.compile(r"^\d{2}-\d{2}$")
+        money_re = re.compile(r"^-?\d{1,3}(?:,\d{3})*\.\d{2}$")
+
+        for page in pages_ir:
+            for table in page.tables:
+                for row in table:
+                    clean = [((c or "").strip()) for c in row]
+                    if not any(clean):
+                        continue
+                    first = clean[0] if clean else ""
+                    if not date_re.match(first):
+                        continue
+                    desc = " ".join(c for c in clean[1:-2] if c).strip() or (clean[1] if len(clean) > 1 else "")
+                    amt_str = next((c for c in reversed(clean) if money_re.match(c)), None)
+                    bal = None
+                    amount = _safe_float(amt_str)
+                    if len(clean) >= 2 and money_re.match(clean[-1]) and money_re.match(clean[-2]):
+                        amount = _safe_float(clean[-2])
+                        bal = _safe_float(clean[-1])
+                    posting_iso = _resolve_mmdd(first, period)
+                    txns.append(
+                        TransactionRecord(
+                            posting_date=posting_iso,
+                            description=desc,
+                            amount=self._normalize_amount(amount, desc),
+                            balance=bal,
+                            category=self._infer_category(desc),
+                            source_bank="NAVY_FEDERAL",
+                        )
+                    )
+        return txns
+
+    def _parse_navy_transactions_from_text(
+        self, full_text: str, period: StatementPeriod | None
+    ) -> list[TransactionRecord]:
+        txns: list[TransactionRecord] = []
         line_pattern = re.compile(
-            r"(?P<date>\d{2}-\d{2})\s+(?P<desc>.+?)\s+(?P<amount>-?\d+\.\d{2})\s+(?P<balance>-?\d+\.\d{2})$"
+            r"(?P<date>\d{2}-\d{2})\s+(?P<desc>.+?)\s+(?P<amount>-?\d+\.\d{2})(?:\s+(?P<balance>-?\d+\.\d{2}))?$"
         )
         for raw in full_text.splitlines():
             line = " ".join(raw.split())
             m = line_pattern.search(line)
             if not m:
                 continue
+            desc = m.group("desc")
+            amount = _safe_float(m.group("amount"))
             txns.append(
                 TransactionRecord(
-                    posting_date=m.group("date"),
-                    description=m.group("desc"),
-                    amount=_safe_float(m.group("amount")),
+                    posting_date=_resolve_mmdd(m.group("date"), period),
+                    description=desc,
+                    amount=self._normalize_amount(amount, desc),
                     balance=_safe_float(m.group("balance")),
-                    category=self._infer_category(m.group("desc")),
+                    category=self._infer_category(desc),
                     source_bank="NAVY_FEDERAL",
                 )
             )
         return txns
 
-    def _parse_td_transactions(self, full_text: str) -> list[TransactionRecord]:
+    def _parse_td_transactions_from_tables(
+        self, pages_ir: list[PageIR], period: StatementPeriod | None
+    ) -> list[TransactionRecord]:
         txns: list[TransactionRecord] = []
-        lines = [" ".join(ln.split()) for ln in full_text.splitlines()]
+        date_re = re.compile(r"^\d{2}/\d{2}$")
+        money_re = re.compile(r"^-?\d{1,3}(?:,\d{3})*\.\d{2}$")
 
-        # Robust two-line/one-line matcher:
-        #   12/23 DBCRD PUR AP, ...
-        #   TESLA SUPERCHARGER ...
-        #   6.98
-        i = 0
-        date_prefix = re.compile(r"^(\d{2}/\d{2})\s+(.+)$")
+        for page in pages_ir:
+            for table in page.tables:
+                for row in table:
+                    clean = [((c or "").strip()) for c in row]
+                    if not clean or not date_re.match(clean[0]):
+                        continue
+                    amounts = [c for c in clean if money_re.match(c)]
+                    amount = _safe_float(amounts[-1]) if amounts else None
+                    desc_parts = [c for c in clean[1:] if c and not money_re.match(c)]
+                    desc = " ".join(desc_parts).strip()
+                    if not desc:
+                        continue
+                    txns.append(
+                        TransactionRecord(
+                            posting_date=_resolve_mmdd(clean[0], period),
+                            description=desc,
+                            amount=self._normalize_amount(amount, desc),
+                            balance=None,
+                            category=self._infer_category(desc),
+                            source_bank="TD_BANK",
+                        )
+                    )
+        return txns
+
+    def _parse_td_transactions_from_text(
+        self, full_text: str, period: StatementPeriod | None
+    ) -> list[TransactionRecord]:
+        txns: list[TransactionRecord] = []
+        lines = [" ".join(ln.split()) for ln in full_text.splitlines() if ln.strip()]
+
+        date_line = re.compile(r"^(\d{2}/\d{2})\s+(.+)$")
         amount_only = re.compile(r"^-?\d{1,3}(?:,\d{3})*\.\d{2}$")
 
+        i = 0
         while i < len(lines):
-            m = date_prefix.match(lines[i])
+            m = date_line.match(lines[i])
             if not m:
                 i += 1
                 continue
 
-            posting_date = m.group(1)
-            desc = m.group(2)
+            mmdd = m.group(1)
+            desc_parts = [m.group(2)]
+            j = i + 1
             amount: float | None = None
 
-            if i + 1 < len(lines) and amount_only.match(lines[i + 1]):
-                amount = _safe_float(lines[i + 1])
-                i += 2
-            elif i + 2 < len(lines) and amount_only.match(lines[i + 2]):
-                desc = f"{desc} {lines[i + 1]}"
-                amount = _safe_float(lines[i + 2])
-                i += 3
-            else:
-                i += 1
-                continue
+            while j < len(lines):
+                if date_line.match(lines[j]):
+                    break
+                if amount_only.match(lines[j]):
+                    amount = _safe_float(lines[j])
+                    j += 1
+                    break
+                desc_parts.append(lines[j])
+                j += 1
 
-            txns.append(
-                TransactionRecord(
-                    posting_date=posting_date,
-                    description=desc,
-                    amount=amount,
-                    balance=None,
-                    category=self._infer_category(desc),
-                    source_bank="TD_BANK",
+            if amount is not None:
+                desc = " ".join(desc_parts).strip()
+                txns.append(
+                    TransactionRecord(
+                        posting_date=_resolve_mmdd(mmdd, period),
+                        description=desc,
+                        amount=self._normalize_amount(amount, desc),
+                        balance=None,
+                        category=self._infer_category(desc),
+                        source_bank="TD_BANK",
+                    )
                 )
-            )
+            i = j if j > i else i + 1
 
         return txns
 
     @staticmethod
+    def _normalize_amount(amount: float | None, description: str) -> float | None:
+        if amount is None:
+            return None
+        lower = description.lower()
+        if any(tok in lower for tok in ("deposit", "credit", "edi paymnt")):
+            return abs(amount)
+        if any(tok in lower for tok in ("payment", "debit", "withdraw", "purchase", "pos", "dbcrd", "pmt")):
+            return -abs(amount)
+        return amount
+
+    @staticmethod
     def _infer_category(description: str) -> str | None:
         d = description.lower()
-        if any(tok in d for tok in ("ach", "deposit", "edi paymnt")):
+        if any(tok in d for tok in ("ach", "deposit", "edi paymnt", "credit")):
             return "deposit"
         if any(tok in d for tok in ("atm", "withdraw")):
             return "cash_withdrawal"
-        if any(tok in d for tok in ("debit", "dbcrd", "purchase", "pos", "pmt", "paypal")):
+        if any(tok in d for tok in ("debit", "dbcrd", "purchase", "pos", "pmt", "paypal", "bill")):
             return "payment"
         return None
 
@@ -458,6 +596,92 @@ def _safe_float(value: str | None) -> float | None:
         return None
 
 
+def _mask_last4(identifier: str | None) -> str | None:
+    if not identifier:
+        return None
+    digits = "".join(ch for ch in identifier if ch.isdigit())
+    if not digits:
+        return None
+    return digits[-4:]
+
+
+def _hash_identifier(identifier: str | None) -> str | None:
+    if not identifier:
+        return None
+    clean = "".join(ch for ch in identifier if ch.isdigit())
+    if not clean:
+        return None
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_statement_period(raw: str | None) -> StatementPeriod | None:
+    if not raw:
+        return None
+
+    # Supports forms like:
+    # - 03/26/25 - 04/27/25
+    # - Dec 12 2024-Jan 11 2025
+    value = " ".join(raw.split())
+
+    m = re.search(r"(\d{2}/\d{2}/\d{2,4})\s*-\s*(\d{2}/\d{2}/\d{2,4})", value)
+    if m:
+        start = _parse_date_flexible(m.group(1))
+        end = _parse_date_flexible(m.group(2))
+        if start and end:
+            return StatementPeriod(start=start, end=end)
+
+    m2 = re.search(
+        r"([A-Za-z]{3}\s+\d{1,2}\s+\d{4})\s*-\s*([A-Za-z]{3}\s+\d{1,2}\s+\d{4})",
+        value,
+    )
+    if m2:
+        start = _parse_date_flexible(m2.group(1))
+        end = _parse_date_flexible(m2.group(2))
+        if start and end:
+            return StatementPeriod(start=start, end=end)
+
+    return None
+
+
+def _parse_date_flexible(raw: str) -> date | None:
+    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_mmdd(mmdd: str, period: StatementPeriod | None) -> str | None:
+    m = re.match(r"^(\d{2})[/-](\d{2})$", mmdd)
+    if not m:
+        return None
+    month = int(m.group(1))
+    day = int(m.group(2))
+
+    if period is None:
+        return None
+
+    candidate_years = {period.start.year, period.end.year, period.start.year - 1, period.end.year + 1}
+    candidates: list[date] = []
+    for year in candidate_years:
+        try:
+            candidates.append(date(year, month, day))
+        except ValueError:
+            continue
+
+    in_range = [d for d in candidates if period.start <= d <= period.end]
+    if in_range:
+        chosen = min(in_range, key=lambda d: abs((period.end - d).days))
+        return chosen.isoformat()
+
+    if candidates:
+        chosen = min(candidates, key=lambda d: abs((period.end - d).days))
+        return chosen.isoformat()
+
+    return None
+
+
 def _iter_pdfs(input_dir: Path) -> Iterable[Path]:
     for path in sorted(input_dir.iterdir()):
         if path.is_file() and path.suffix.lower() == ".pdf":
@@ -470,8 +694,18 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
-def _worker_compile(pdf_path: str, output_dir: str, text_density_threshold: int, ocr_dpi: int) -> WorkerResult:
-    compiler = PDFCompiler(text_density_threshold=text_density_threshold, ocr_dpi=ocr_dpi)
+def _worker_compile(
+    pdf_path: str,
+    output_dir: str,
+    text_density_threshold: int,
+    ocr_dpi: int,
+    emit_transactions: bool,
+) -> WorkerResult:
+    compiler = PDFCompiler(
+        text_density_threshold=text_density_threshold,
+        ocr_dpi=ocr_dpi,
+        emit_transactions=emit_transactions,
+    )
     src = Path(pdf_path)
     out = Path(output_dir) / f"{src.stem}.json"
 
@@ -494,6 +728,8 @@ def compile_directory(
     workers: int,
     text_density_threshold: int = 80,
     ocr_dpi: int = 300,
+    lockstep: bool = False,
+    emit_transactions: bool = True,
 ) -> tuple[int, int, float]:
     pdf_files = list(_iter_pdfs(input_dir))
     if not pdf_files:
@@ -503,35 +739,53 @@ def compile_directory(
     start = time.perf_counter()
     success = 0
     durations: list[float] = []
+    total = len(pdf_files)
 
-    worker_count = max(1, workers)
-    print(f"[INFO] Compiling {len(pdf_files)} PDF(s) with {worker_count} worker(s)")
-
-    with ProcessPoolExecutor(max_workers=worker_count) as pool:
-        future_map = {
-            pool.submit(_worker_compile, str(p), str(output_dir), text_density_threshold, ocr_dpi): p
-            for p in pdf_files
-        }
-        completed = 0
-        for future in as_completed(future_map):
-            completed += 1
-            src = future_map[future]
-            try:
-                result = future.result()
-                durations.append(result.duration_seconds)
-                if result.success:
-                    success += 1
-                    print(f"[OK] {completed}/{len(pdf_files)} {src.name} -> {Path(result.output_json).name}")
-                else:
-                    print(f"[ERR] {completed}/{len(pdf_files)} {src.name} -> error report JSON emitted")
-            except Exception as exc:
-                print(f"[ERR] {completed}/{len(pdf_files)} {src.name} -> worker crashed: {exc}")
+    if lockstep:
+        print(f"[INFO] Lockstep mode enabled: processing {total} PDF(s) sequentially")
+        for idx, pdf in enumerate(pdf_files, start=1):
+            result = _worker_compile(str(pdf), str(output_dir), text_density_threshold, ocr_dpi, emit_transactions)
+            durations.append(result.duration_seconds)
+            if result.success:
+                success += 1
+                print(f"[OK] {idx}/{total} {pdf.name} -> {Path(result.output_json).name}")
+            else:
+                print(f"[ERR] {idx}/{total} {pdf.name} -> error report JSON emitted")
+    else:
+        worker_count = max(1, workers)
+        print(f"[INFO] Compiling {total} PDF(s) with {worker_count} worker(s)")
+        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            future_map = {
+                pool.submit(
+                    _worker_compile,
+                    str(p),
+                    str(output_dir),
+                    text_density_threshold,
+                    ocr_dpi,
+                    emit_transactions,
+                ): p
+                for p in pdf_files
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                completed += 1
+                src = future_map[future]
+                try:
+                    result = future.result()
+                    durations.append(result.duration_seconds)
+                    if result.success:
+                        success += 1
+                        print(f"[OK] {completed}/{total} {src.name} -> {Path(result.output_json).name}")
+                    else:
+                        print(f"[ERR] {completed}/{total} {src.name} -> error report JSON emitted")
+                except Exception as exc:
+                    print(f"[ERR] {completed}/{total} {src.name} -> worker crashed: {exc}")
 
     elapsed = time.perf_counter() - start
-    failed = len(pdf_files) - success
+    failed = total - success
     avg = (sum(durations) / len(durations)) if durations else 0.0
     print("[SUMMARY] Compilation complete")
-    print(f"[SUMMARY] Success={success} Failed={failed} Total={len(pdf_files)}")
+    print(f"[SUMMARY] Success={success} Failed={failed} Total={total}")
     print(f"[SUMMARY] Wall={elapsed:.2f}s AvgFile={avg:.2f}s")
     return success, failed, elapsed
 
@@ -547,12 +801,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of worker processes",
     )
     parser.add_argument(
+        "--lockstep",
+        action="store_true",
+        help="Process PDFs sequentially (overrides multiprocessing).",
+    )
+    parser.add_argument(
         "--text-density-threshold",
         type=int,
         default=80,
         help="Minimum native chars to skip OCR fallback",
     )
     parser.add_argument("--ocr-dpi", type=int, default=300, help="OCR rasterization DPI")
+    parser.add_argument(
+        "--emit-transactions",
+        action="store_true",
+        help="Enable bank-specific semantic parsing and transaction emission.",
+    )
     return parser
 
 
@@ -561,12 +825,15 @@ def main() -> None:
     if not args.input.exists() or not args.input.is_dir():
         raise SystemExit(f"Input directory invalid: {args.input}")
     args.output.mkdir(parents=True, exist_ok=True)
+
     compile_directory(
         input_dir=args.input,
         output_dir=args.output,
         workers=args.workers,
         text_density_threshold=args.text_density_threshold,
         ocr_dpi=args.ocr_dpi,
+        lockstep=args.lockstep,
+        emit_transactions=args.emit_transactions,
     )
 
 
