@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GamifyED MVP</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0f172a;
+        --card: #1e293b;
+        --muted: #94a3b8;
+        --text: #e2e8f0;
+        --accent: #38bdf8;
+      }
+      body { margin: 0; font-family: Inter, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+      .container { max-width: 1100px; margin: 0 auto; padding: 1rem; }
+      .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); }
+      .card { background: var(--card); border-radius: 12px; padding: 1rem; border: 1px solid #334155; }
+      h1,h2,h3 { margin-top: 0; }
+      input,select,textarea,button { width: 100%; box-sizing: border-box; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: var(--text); padding: .6rem .7rem; margin: .35rem 0; }
+      button { background: #0369a1; cursor: pointer; font-weight: 600; }
+      button.secondary { background: #334155; }
+      .row { display: flex; gap: .5rem; flex-wrap: wrap; }
+      .row > * { flex: 1; min-width: 100px; }
+      .muted { color: var(--muted); }
+      .pill { display: inline-block; padding: .25rem .55rem; border-radius: 99px; background: #0ea5e91f; border: 1px solid #0ea5e9; font-size: .85rem; }
+      .hidden { display: none; }
+      pre { white-space: pre-wrap; background: #0b1220; padding: .75rem; border-radius: 8px; border: 1px solid #1e293b; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>GamifyED MVP</h1>
+      <p class="muted">Mission-driven retrieval practice, recovery-friendly sessions, and spaced review scheduling.</p>
+
+      <section id="auth" class="card">
+        <h2>Sign in / Register</h2>
+        <input id="email" type="email" placeholder="Email" />
+        <input id="name" type="text" placeholder="Name (for register)" />
+        <input id="password" type="password" placeholder="Password" />
+        <div class="row">
+          <button onclick="register()">Register</button>
+          <button class="secondary" onclick="login()">Login</button>
+        </div>
+        <p id="authStatus" class="muted"></p>
+      </section>
+
+      <section id="app" class="hidden">
+        <div class="grid">
+          <div class="card">
+            <h2>Mission Board</h2>
+            <p id="missionTitle">Select a mission</p>
+            <p class="muted" id="missionDesc"></p>
+            <p>Mastery state: <span id="mastery" class="pill">Fragile</span></p>
+            <label>Mission</label>
+            <select id="missionSelect"></select>
+            <label>Session mode</label>
+            <select id="sessionMode">
+              <option value="rescue">15 min rescue</option>
+              <option value="standard" selected>30 min standard</option>
+              <option value="deep">60 min deep</option>
+              <option value="mastery">90 min mastery</option>
+            </select>
+            <button onclick="startSession()">Start session</button>
+            <p id="sessionStatus" class="muted"></p>
+          </div>
+
+          <div class="card">
+            <h2>Complete Session</h2>
+            <input id="sessionId" type="number" placeholder="Session ID" />
+            <label>Retrieval score (0 to 1)</label>
+            <input id="retrievalScore" type="number" min="0" max="1" step="0.05" value="0.7" />
+            <label>Confidence (0 to 1)</label>
+            <input id="confidence" type="number" min="0" max="1" step="0.05" value="0.6" />
+            <textarea id="errorLog" rows="3" placeholder="Error log (e.g., definition forgotten)"></textarea>
+            <textarea id="threadDelta" rows="5" placeholder="Thread sheet updates"></textarea>
+            <button onclick="completeSession()">Complete + schedule review</button>
+            <p id="completeStatus" class="muted"></p>
+          </div>
+
+          <div class="card">
+            <h2>Dashboard</h2>
+            <pre id="dashboard">{}</pre>
+            <button class="secondary" onclick="loadDashboard()">Refresh dashboard</button>
+            <h3>Due reviews</h3>
+            <pre id="dueReviews">[]</pre>
+            <button class="secondary" onclick="loadDue()">Refresh due reviews</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      let token = localStorage.getItem('gamifyed_token') || '';
+      let missions = [];
+
+      async function api(path, options = {}) {
+        const res = await fetch(path, {
+          ...options,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            ...(options.headers || {})
+          }
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+        return data;
+      }
+
+      function setStatus(id, text) { document.getElementById(id).textContent = text; }
+
+      async function register() {
+        try {
+          const data = await api('/api/auth/register', {
+            method: 'POST', body: JSON.stringify({
+              email: document.getElementById('email').value,
+              password: document.getElementById('password').value,
+              name: document.getElementById('name').value || 'Learner'
+            })
+          });
+          token = data.token;
+          localStorage.setItem('gamifyed_token', token);
+          setStatus('authStatus', 'Registered successfully.');
+          afterAuth();
+        } catch (e) { setStatus('authStatus', e.message); }
+      }
+
+      async function login() {
+        try {
+          const data = await api('/api/auth/login', {
+            method: 'POST', body: JSON.stringify({
+              email: document.getElementById('email').value,
+              password: document.getElementById('password').value
+            })
+          });
+          token = data.token;
+          localStorage.setItem('gamifyed_token', token);
+          setStatus('authStatus', 'Logged in successfully.');
+          afterAuth();
+        } catch (e) { setStatus('authStatus', e.message); }
+      }
+
+      async function afterAuth() {
+        document.getElementById('auth').classList.add('hidden');
+        document.getElementById('app').classList.remove('hidden');
+        await loadMissions();
+        await loadDashboard();
+        await loadDue();
+      }
+
+      async function loadMissions() {
+        missions = await api('/api/missions');
+        const select = document.getElementById('missionSelect');
+        select.innerHTML = '';
+        missions.forEach((m) => {
+          const option = document.createElement('option');
+          option.value = m.id;
+          option.textContent = `${m.title} (${m.mastery_state})`;
+          select.append(option);
+        });
+        select.onchange = showMission;
+        showMission();
+      }
+
+      function showMission() {
+        const id = Number(document.getElementById('missionSelect').value || missions[0]?.id);
+        const mission = missions.find((m) => m.id === id);
+        if (!mission) return;
+        document.getElementById('missionTitle').textContent = mission.title;
+        document.getElementById('missionDesc').textContent = mission.description;
+        document.getElementById('mastery').textContent = mission.mastery_state;
+      }
+
+      async function startSession() {
+        try {
+          const missionId = Number(document.getElementById('missionSelect').value);
+          const mode = document.getElementById('sessionMode').value;
+          const { sessionId } = await api('/api/sessions/start', {
+            method: 'POST', body: JSON.stringify({ missionId, mode })
+          });
+          document.getElementById('sessionId').value = sessionId;
+          setStatus('sessionStatus', `Session ${sessionId} started. Resume from this ID if interrupted.`);
+        } catch (e) { setStatus('sessionStatus', e.message); }
+      }
+
+      async function completeSession() {
+        try {
+          const sessionId = Number(document.getElementById('sessionId').value);
+          const payload = {
+            retrievalScore: Number(document.getElementById('retrievalScore').value),
+            confidence: Number(document.getElementById('confidence').value),
+            errorLog: document.getElementById('errorLog').value,
+            threadSheetDelta: document.getElementById('threadDelta').value
+          };
+          const result = await api(`/api/sessions/${sessionId}/complete`, { method: 'POST', body: JSON.stringify(payload) });
+          setStatus('completeStatus', `Next review in ${result.intervalDays} day(s). XP earned: ${result.xp.total}`);
+          await loadMissions();
+          await loadDashboard();
+          await loadDue();
+        } catch (e) { setStatus('completeStatus', e.message); }
+      }
+
+      async function loadDashboard() {
+        try {
+          const data = await api('/api/dashboard');
+          document.getElementById('dashboard').textContent = JSON.stringify(data, null, 2);
+        } catch (e) {
+          document.getElementById('dashboard').textContent = JSON.stringify({ error: e.message }, null, 2);
+        }
+      }
+
+      async function loadDue() {
+        try {
+          const data = await api('/api/reviews/due');
+          document.getElementById('dueReviews').textContent = JSON.stringify(data, null, 2);
+        } catch (e) {
+          document.getElementById('dueReviews').textContent = JSON.stringify({ error: e.message }, null, 2);
+        }
+      }
+
+      if (token) afterAuth();
+    </script>
+  </body>
+</html>
